@@ -1,0 +1,1 @@
+{"description":"AMG device lock API — test bridge between the phone lock app and the dashboard policy (TEST only, no real customer data).","engines":{"node":">=18"},"name":"amg-device-api","private":true,"scripts":{"start":"node server.mjs"},"type":"module","version":"1.0.0"}

@@ -1,0 +1,13 @@
+# Render Blueprint — AMG device API (TEST server, free tier)
+# Deploy: Render dashboard → New → Blueprint → is repo ko chunein.
+# AMG_SEED_TOKEN ki value Render deploy ke waqt khud mange ga —
+# wo aap apni marzi ka koi mushkil lafz rakhein, chat mein kabhi na bhejein.
+services:
+  - type: web
+    name: amg-device-api
+    env: node
+    plan: free
+    startCommand: node server.mjs
+    envVars:
+      - key: AMG_SEED_TOKEN
+        sync: false
