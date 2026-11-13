@@ -64,8 +64,14 @@ function genCode(n) {
   for (let i = 0; i < n; i++) s += CODE_CHARS[b[i] % CODE_CHARS.length];
   return s;
 }
+// Pakistan time (Asia/Karachi): due/grace dates are calendar dates in PKT,
+// so "today" must be the Karachi date, not the UTC date (S-M1 fix — UTC
+// date was up to 5 hours behind, warnings/locks fired late).
+const PKT_DATE_FMT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Karachi", year: "numeric", month: "2-digit", day: "2-digit",
+});
 function todayStr(d = new Date()) {
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD (UTC date)
+  return PKT_DATE_FMT.format(d); // YYYY-MM-DD (Pakistan date)
 }
 function addDays(dateStr, days) {
   const d = new Date(dateStr + "T00:00:00Z");
@@ -133,7 +139,12 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/device/checkin") {
       const b = await readJson(req);
-      const acct = db.accounts.find((a) => a.deviceId === String(b.deviceId || ""));
+      // S-C1 fix: khaali/missing deviceId pehle hi reject karein — warna ye
+      // pehle unregistered account (deviceId "") se match ho jata tha aur
+      // us ka data (due date, balance, lock code) leak ho jata tha.
+      const deviceId = String(b.deviceId || "").trim();
+      if (!deviceId) return send(res, 200, { ok: false, error: "device_not_registered" });
+      const acct = db.accounts.find((a) => a.deviceId === deviceId);
       if (!acct) return send(res, 200, { ok: false, error: "device_not_registered" });
       if (b.pairingCode && acct.pairingCode.toUpperCase() !== String(b.pairingCode).trim().toUpperCase()) {
         return send(res, 200, { ok: false, error: "invalid_pairing_code" });
@@ -176,7 +187,10 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/device/offline-code-used") {
       const b = await readJson(req);
-      const acct = db.accounts.find((a) => a.deviceId === String(b.deviceId || ""));
+      // S-C1 fix: khaali/missing deviceId pehle hi reject karein (checkin jaisa).
+      const deviceId = String(b.deviceId || "").trim();
+      if (!deviceId) return send(res, 200, { ok: false, error: "device_not_registered" });
+      const acct = db.accounts.find((a) => a.deviceId === deviceId);
       if (!acct) return send(res, 200, { ok: false, error: "device_not_registered" });
       if (acct.lockState !== "locked" || !acct.unlockCode ||
           String(b.code || "").trim().toUpperCase() !== acct.unlockCode.toUpperCase()) {
@@ -202,7 +216,7 @@ const server = createServer(async (req, res) => {
         id: db.nextAccountId++, shopName: String(b.shopName || "Al Arab Electronic"),
         shopPhone: String(b.shopPhone || ""), customerName: String(b.customerName || "Test Customer"),
         pairingCode: genCode(8), graceDays, status: "active", lockState: "unlocked",
-        unlockCode: "", deviceId: "", deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
+        unlockCode: "", deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
       };
       db.accounts.push(acct);
       for (let i = 0; i < months; i++) {
