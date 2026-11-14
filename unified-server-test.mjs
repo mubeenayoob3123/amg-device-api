@@ -366,6 +366,14 @@ async function main() {
     await req(34565, "POST", "/api/device/sync", syncBody(403, "M1403AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1EEEE" }), syncH);
     r = await req(34565, "GET", "/api/device/status?dashboardAccountId=403", undefined, syncH);
     t("L2: re-issued fresh code resets latch", r.json?.offlineCodeUsed === false, r.json);
+    // L2b: burned code ("") with an adopted window must NOT cancel the
+    // window (dashboard-redeem case: the phone never typed the code, so
+    // the server still holds the old code; syncing "" is a burn, not a
+    // new cycle). UAT fix round mein pakra gaya contract gap.
+    await req(34565, "POST", "/api/device/sync", syncBody(406, "M1406AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "M1BURN" }), syncH);
+    await req(34565, "POST", "/api/device/sync", syncBody(406, "M1406AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "", offlineUnlockUntil: win12h, offlineCodeUsed: true }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=406", undefined, syncH);
+    t("L2b: burned code (\"\") keeps adopted window + latch", r.json?.offlineUnlockUntil === win12h && r.json?.offlineCodeUsed === true, r.json);
     // L3: PU-M3 — manual lock cancels the window.
     await req(34565, "POST", "/api/device/sync", syncBody(404, "M3404AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "M3CODE1" }), syncH);
     r = await register(34565, "M3404AAA");

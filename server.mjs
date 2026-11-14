@@ -38,8 +38,9 @@
 //     saaf taur par bheji gayi offlineUnlockUntil / offlineCodeUsed
 //     RESTORE ho jati hain (wipe ke baad dashboard ki adopted window
 //     wapas aati hai); na bheji jayein to purani qeemat rehti hai.
-//   - v2.1 (PU-M1): sync mein purane se MUKHTALIF unlockCode aaye to
-//     naya lock cycle hai — offlineCodeUsed reset, window saaf.
+//   - v2.1 (PU-M1): sync mein purane se MUKHTALIF ghair-khaali
+//     unlockCode aaye to naya lock cycle hai — offlineCodeUsed reset,
+//     window saaf. Khaali code ("") naya cycle nahi (burned code hai).
 //   - v2.1 (PU-M3): sync mein lockState locked aaye to window HAMESHA
 //     saaf ho jati hai — dukaan ka saaf lock window se oopar hai.
 //   - Synced account ka offline unlock code sirf dashboard deta hai;
@@ -447,7 +448,10 @@ function upsertSyncedAccount(norm) {
     // 2) PU-M1: naya code (purane se mukhtalif) = naya lock cycle —
     //    latch reset, window saaf. Ye restore KE BAAD chalta hai taake
     //    naya code aane par latch kabhi purane code ka na reh jaye.
-    if (norm.unlockCode !== undefined && norm.unlockCode !== oldUnlockCode) {
+    //    Khaali code ("") naya cycle NAHI hai — wo jala hua (burned)
+    //    code hai; is par rule chala to dashboard-redeem ki adopted
+    //    window ghalat saaf ho jaye gi (UAT fix round mein pakra gaya).
+    if (norm.unlockCode !== undefined && norm.unlockCode !== "" && norm.unlockCode !== oldUnlockCode) {
       acct.offlineCodeUsed = 0;
       acct.offlineUnlockUntil = "";
     }
