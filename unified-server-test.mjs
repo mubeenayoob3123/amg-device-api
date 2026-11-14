@@ -99,7 +99,7 @@ async function main() {
     r = await req(34561, "GET", "/api/device/status?dashboardAccountId=1", undefined, syncH);
     t("status bina token env -> 403 sync_disabled", r.status === 403 && r.json?.error === "sync_disabled", r.json);
     r = await req(34561, "GET", "/health");
-    t("health version unified-1 + counts", r.json?.version === "unified-1" && r.json?.accounts === 0 && r.json?.syncedAccounts === 0, r.json);
+    t("health version unified-2 + counts", r.json?.version === "unified-2" && r.json?.accounts === 0 && r.json?.syncedAccounts === 0, r.json);
     await stopServer(server); server = null;
 
     // ---- Server B: dono tokens set ----
@@ -158,7 +158,7 @@ async function main() {
     r = await register(34562, "UNIF102B");
     const dev102 = r.json.deviceId;
     r = await checkin(34562, dev102, "UNIF102B");
-    t("due kal, grace baqi -> warn + graceDaysLeft=4", r.json?.instruction === "warn" && r.json?.graceDaysLeft === 4, r.json);
+    t("due kal, grace baqi -> warn + graceDaysLeft=5 (inclusive)", r.json?.instruction === "warn" && r.json?.graceDaysLeft === 5, r.json);
     await req(34562, "POST", "/api/device/sync", syncBody(103, "UNIF103C", [inst(1, pktDate(-10), 10000), inst(2, addMonthsStr(pktDate(-10), 1), 10000)], { unlockCode: "SYNCED1" }), syncH);
     r = await register(34562, "UNIF103C");
     const dev103 = r.json.deviceId;
@@ -304,6 +304,292 @@ async function main() {
     r = await register(34564, "SCOP305E");
     r = await checkin(34564, r.json?.deviceId, "SCOP305E");
     t("manual lock autoLock off mein bhi lock_now", r.json?.ok === true && r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "MANU01", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server E: v2.1 sync — PU-M5 restore, PU-M1 latch reset, PU-M3 lock wins ----
+    console.log("\n== L. v2.1 sync: window restore + new-code reset + manual lock ==");
+    const dataE = join(dir, "e.json");
+    server = await startServer({ port: 34565, dataFile: dataE, seedToken: SEED, syncToken: SYNC });
+    const win12h = new Date(Date.now() + 12 * 3600 * 1000).toISOString();
+    // L1: PU-M5 — explicit window/latch restore via sync.
+    await req(34565, "POST", "/api/device/sync", syncBody(401, "M5401AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "M5CODE1" }), syncH);
+    r = await register(34565, "M5401AAA");
+    const dev401 = r.json.deviceId;
+    r = await checkin(34565, dev401, "M5401AAA");
+    t("L1: locked + code -> lock_now + M5CODE1", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "M5CODE1", r.json);
+    r = await req(34565, "POST", "/api/device/offline-code-used", { deviceId: dev401, code: "M5CODE1" });
+    t("L1: code use -> ok + window", r.json?.ok === true && typeof r.json?.offlineUnlockUntil === "string" && r.json.offlineUnlockUntil.length > 0, r.json);
+    // Dashboard re-asserts an adopted window (wipe ke baad jaisa).
+    r = await req(34565, "POST", "/api/device/sync", syncBody(401, "M5401AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "", offlineUnlockUntil: win12h, offlineCodeUsed: true }), syncH);
+    t("L1: sync window restore ok", r.json?.ok === true, r.json);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=401", undefined, syncH);
+    t("L1: PU-M5 status shows restored window + latch", r.json?.offlineUnlockUntil === win12h && r.json?.offlineCodeUsed === true, r.json);
+    r = await checkin(34565, dev401, "M5401AAA");
+    t("L1: restored window honoured -> stay_unlocked", r.json?.instruction === "stay_unlocked" && r.json?.offlineUnlockUntil === win12h, r.json);
+    // Explicit clear.
+    await req(34565, "POST", "/api/device/sync", syncBody(401, "M5401AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "", offlineUnlockUntil: "", offlineCodeUsed: false }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=401", undefined, syncH);
+    t("L1: explicit window/latch clear works", r.json?.offlineUnlockUntil === "" && r.json?.offlineCodeUsed === false, r.json);
+    // Validation of the new fields.
+    r = await req(34565, "POST", "/api/device/sync", syncBody(405, "M5405AAA", [inst(1, pktDate(30), 10000)], { offlineUnlockUntil: "not-a-date" }), syncH);
+    t("L: kharab offlineUnlockUntil -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    r = await req(34565, "POST", "/api/device/sync", syncBody(405, "M5405AAA", [inst(1, pktDate(30), 10000)], { offlineCodeUsed: "haan" }), syncH);
+    t("L: kharab offlineCodeUsed -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    // L2: PU-M1 — new-code latch reset.
+    await req(34565, "POST", "/api/device/sync", syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1AAAA", offlineUnlockUntil: win12h, offlineCodeUsed: true }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
+    t("L2: restore sets latch + window on new account", r.json?.offlineCodeUsed === true && r.json?.offlineUnlockUntil === win12h, r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1AAAA" }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
+    t("L2: same code re-sync keeps latch + window", r.json?.offlineCodeUsed === true && r.json?.offlineUnlockUntil === win12h, r.json);
+    const noCodeBody = syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)]);
+    delete noCodeBody.unlockCode;
+    await req(34565, "POST", "/api/device/sync", noCodeBody, syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
+    t("L2: unlockCode omitted keeps latch + window", r.json?.offlineCodeUsed === true && r.json?.offlineUnlockUntil === win12h, r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1BBBB" }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
+    t("L2: PU-M1 fresh code resets latch + clears window", r.json?.offlineCodeUsed === false && r.json?.offlineUnlockUntil === "", r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1CCCC", offlineUnlockUntil: win12h, offlineCodeUsed: true }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
+    t("L2: fresh code wins over explicit latch restore", r.json?.offlineCodeUsed === false && r.json?.offlineUnlockUntil === "", r.json);
+    // Full cycle: use code -> dashboard syncs "" -> latch stays; fresh code -> reset.
+    await req(34565, "POST", "/api/device/sync", syncBody(403, "M1403AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "M1DDDD" }), syncH);
+    r = await register(34565, "M1403AAA");
+    const dev403 = r.json.deviceId;
+    await checkin(34565, dev403, "M1403AAA");
+    r = await req(34565, "POST", "/api/device/offline-code-used", { deviceId: dev403, code: "M1DDDD" });
+    t("L2: full cycle code use ok", r.json?.ok === true, r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(403, "M1403AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "" }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=403", undefined, syncH);
+    t("L2: dashboard burns code (\"\") -> latch stays 1", r.json?.offlineCodeUsed === true, r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(403, "M1403AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1EEEE" }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=403", undefined, syncH);
+    t("L2: re-issued fresh code resets latch", r.json?.offlineCodeUsed === false, r.json);
+    // L3: PU-M3 — manual lock cancels the window.
+    await req(34565, "POST", "/api/device/sync", syncBody(404, "M3404AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "M3CODE1" }), syncH);
+    r = await register(34565, "M3404AAA");
+    const dev404 = r.json.deviceId;
+    r = await checkin(34565, dev404, "M3404AAA");
+    t("L3: manual lock -> lock_now + code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "M3CODE1", r.json);
+    await req(34565, "POST", "/api/device/offline-code-used", { deviceId: dev404, code: "M3CODE1" });
+    r = await checkin(34565, dev404, "M3404AAA");
+    t("L3: window active -> stay_unlocked", r.json?.instruction === "stay_unlocked", r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(404, "M3404AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "M3CODE2" }), syncH);
+    r = await checkin(34565, dev404, "M3404AAA");
+    t("L3: PU-M3 manual lock during window -> lock_now (window cancelled)", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "M3CODE2", r.json);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=404", undefined, syncH);
+    t("L3: status window cleared after manual lock", r.json?.offlineUnlockUntil === "", r.json);
+    await req(34565, "POST", "/api/device/sync", syncBody(404, "M3404AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "M3CODE2", offlineUnlockUntil: win12h }), syncH);
+    r = await req(34565, "GET", "/api/device/status?dashboardAccountId=404", undefined, syncH);
+    t("L3: locked + explicit window -> window still cleared", r.json?.offlineUnlockUntil === "", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server F: PU-M5 wipe survival (window + latch via sync-all) ----
+    console.log("\n== M. PU-M5 wipe survival ==");
+    const dataF = join(dir, "f.json");
+    server = await startServer({ port: 34566, dataFile: dataF, seedToken: SEED, syncToken: SYNC });
+    await req(34566, "POST", "/api/device/sync", syncBody(411, "M5411AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "M5WIP01" }), syncH);
+    r = await register(34566, "M5411AAA");
+    const dev411 = r.json.deviceId;
+    await checkin(34566, dev411, "M5411AAA");
+    r = await req(34566, "POST", "/api/device/offline-code-used", { deviceId: dev411, code: "M5WIP01" });
+    const earnedWindow = r.json.offlineUnlockUntil;
+    t("M: pre-wipe window earned", r.json?.ok === true && typeof earnedWindow === "string" && earnedWindow.length > 0, r.json);
+    await stopServer(server); server = null;
+    unlinkSync(dataF);
+    server = await startServer({ port: 34566, dataFile: dataF, seedToken: SEED, syncToken: SYNC });
+    r = await req(34566, "GET", "/health");
+    t("M: wipe ke baad accounts=0", r.json?.accounts === 0, r.json);
+    // Dashboard re-asserts the adopted window + latch via sync-all.
+    r = await req(34566, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(411, "M5411AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M5WIP01", offlineUnlockUntil: earnedWindow, offlineCodeUsed: true })] }, syncH);
+    t("M: sync-all with adopted window ok", r.json?.ok === true && r.json?.synced === 1, r.json);
+    r = await req(34566, "GET", "/api/device/status?dashboardAccountId=411", undefined, syncH);
+    t("M: PU-M5 window + latch survive wipe via sync-all", r.json?.offlineUnlockUntil === earnedWindow && r.json?.offlineCodeUsed === true, r.json);
+    r = await register(34566, "M5411AAA");
+    t("M: wipe ke baad dobara register usi code se hota hai", r.json?.ok === true, r.json);
+    r = await checkin(34566, r.json.deviceId, "M5411AAA");
+    t("M: re-register ke baad window ab bhi stay_unlocked deti hai", r.json?.instruction === "stay_unlocked" && r.json?.offlineUnlockUntil === earnedWindow, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server G: PU-M8 re-register guard + reset PIN ----
+    console.log("\n== N. PU-M8 re-register guard + reset PIN ==");
+    const dataG = join(dir, "g.json");
+    server = await startServer({ port: 34567, dataFile: dataG, seedToken: SEED, syncToken: SYNC });
+    await req(34567, "POST", "/api/device/sync", syncBody(501, "M8501AAA", [inst(1, pktDate(30), 10000)], { resetPin: "2468" }), syncH);
+    r = await register(34567, "M8501AAA");
+    const dev501 = r.json.deviceId;
+    t("N: register returns resetPin from sync", r.json?.ok === true && r.json?.resetPin === "2468", r.json);
+    r = await req(34567, "GET", "/api/device/status?dashboardAccountId=501", undefined, syncH);
+    t("N: status lastReregisterAt khaali (abhi koi re-register nahi)", r.json?.lastReregisterAt === "", r.json);
+    r = await register(34567, "M8501AAA");
+    t("N: PU-M8 same-code re-register bina deviceId -> 403 reregister_blocked", r.status === 403 && r.json?.error === "reregister_blocked" && typeof r.json?.message === "string", r.json);
+    r = await req(34567, "POST", "/api/device/register", { pairingCode: "M8501AAA", imei: "999", model: "Other Phone", androidVersion: "14", deviceId: "dev_ghalat" });
+    t("N: re-register ghalat deviceId se -> 403", r.status === 403 && r.json?.error === "reregister_blocked", r.json);
+    r = await req(34567, "POST", "/api/device/register", { pairingCode: "M8501AAA", imei: "123456789012345", model: "Pixel Test", androidVersion: "14", deviceId: dev501 });
+    t("N: re-register purane deviceId se -> ok (naya deviceId)", r.json?.ok === true && typeof r.json?.deviceId === "string" && r.json.deviceId !== dev501 && r.json?.resetPin === "2468", r.json);
+    const dev501b = r.json.deviceId;
+    r = await req(34567, "GET", "/api/device/status?dashboardAccountId=501", undefined, syncH);
+    t("N: status lastReregisterAt set after re-register", typeof r.json?.lastReregisterAt === "string" && r.json.lastReregisterAt.length > 0, r.json);
+    r = await checkin(34567, dev501, "M8501AAA");
+    t("N: purana deviceId re-register ke baad dead hai", r.json?.ok === false && r.json?.error === "device_not_registered", r.json);
+    r = await checkin(34567, dev501b, "M8501AAA");
+    t("N: naya deviceId checkin karta hai", r.json?.ok === true, r.json);
+    // Pairing code regenerate -> fresh code se re-register khula hai.
+    await req(34567, "POST", "/api/device/sync", syncBody(501, "NEW501AA", [inst(1, pktDate(30), 10000)], { resetPin: "2468" }), syncH);
+    r = await register(34567, "M8501AAA");
+    t("N: purana pairing code regenerate ke baad invalid", r.json?.ok === false && r.json?.error === "invalid_pairing_code", r.json);
+    r = await register(34567, "NEW501AA");
+    t("N: naya pairing code se re-register ok (bina deviceId)", r.json?.ok === true, r.json);
+    // Seed account: no PIN -> empty string.
+    r = await req(34567, "POST", "/api/test/seed", { total: 10000, months: 1, graceDays: 5, firstDueDate: pktDate(30) }, seedH);
+    r = await register(34567, r.json.pairingCode);
+    t("N: seed register resetPin khaali string", r.json?.ok === true && r.json?.resetPin === "", r.json);
+    // resetPin sync se update hota hai.
+    await req(34567, "POST", "/api/device/sync", syncBody(502, "M8502AAA", [inst(1, pktDate(30), 10000)], { resetPin: "1357" }), syncH);
+    await req(34567, "POST", "/api/device/sync", syncBody(502, "M8502AAA", [inst(1, pktDate(30), 10000)], { resetPin: "9999" }), syncH);
+    r = await register(34567, "M8502AAA");
+    t("N: resetPin sync se update hota hai", r.json?.resetPin === "9999", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server H: PU-S7 / PU-S9 / PU-S14 / PU-N4 ----
+    console.log("\n== O. PU-S7 code rotation + PU-S9 qist number + PU-S14 grace + PU-N4 addMonths ==");
+    const dataH = join(dir, "h.json");
+    server = await startServer({ port: 34568, dataFile: dataH, seedToken: SEED, syncToken: SYNC });
+    // S7: latch set + same code (wipe-restore jaisa) -> lock_now code NAHI bhejta.
+    await req(34568, "POST", "/api/device/sync", syncBody(601, "S7601AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "S7CODE1", offlineCodeUsed: true }), syncH);
+    r = await register(34568, "S7601AAA");
+    const dev601 = r.json.deviceId;
+    r = await checkin(34568, dev601, "S7601AAA");
+    t("O: PU-S7 locked + latch 1 -> lock_now code ke BAGHAIR", r.json?.instruction === "lock_now" && !("offlineUnlockCode" in (r.json || {})), r.json);
+    r = await req(34568, "POST", "/api/device/offline-code-used", { deviceId: dev601, code: "S7CODE1" });
+    t("O: S7 istemal shuda code dobara reject hota hai", r.json?.ok === false && r.json?.error === "invalid_unlock_code", r.json);
+    await req(34568, "POST", "/api/device/sync", syncBody(601, "S7601AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "S7CODE2" }), syncH);
+    r = await checkin(34568, dev601, "S7601AAA");
+    t("O: S7 fresh code sync se -> lock_now WITH naya code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "S7CODE2", r.json);
+    // Latch 0 -> code milta hai (control).
+    await req(34568, "POST", "/api/device/sync", syncBody(602, "S7602AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "S7CODE3" }), syncH);
+    r = await register(34568, "S7602AAA");
+    r = await checkin(34568, r.json.deviceId, "S7602AAA");
+    t("O: S7 locked + latch 0 -> lock_now WITH code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "S7CODE3", r.json);
+    // S9: installmentNumber / installmentTotal.
+    const six = [
+      inst(1, pktDate(-70), 10000, 10000), inst(2, pktDate(-40), 10000, 10000),
+      inst(3, pktDate(-10), 10000), inst(4, pktDate(20), 10000),
+      inst(5, pktDate(50), 10000), inst(6, pktDate(80), 10000),
+    ];
+    await req(34568, "POST", "/api/device/sync", syncBody(603, "S9603AAA", six), syncH);
+    r = await register(34568, "S9603AAA");
+    r = await checkin(34568, r.json.deviceId, "S9603AAA");
+    t("O: PU-S9 overdue qist #3 of 6", r.json?.instruction === "lock_now" && r.json?.installmentNumber === 3 && r.json?.installmentTotal === 6, r.json);
+    await req(34568, "POST", "/api/device/sync", syncBody(604, "S9604AAA", [inst(1, pktDate(30), 10000), inst(2, pktDate(60), 10000), inst(3, pktDate(90), 10000)]), syncH);
+    r = await register(34568, "S9604AAA");
+    const dev604 = r.json.deviceId;
+    r = await checkin(34568, dev604, "S9604AAA");
+    t("O: S9 kuch overdue nahi -> agli qist #1 of 3", r.json?.instruction === "stay_unlocked" && r.json?.installmentNumber === 1 && r.json?.installmentTotal === 3, r.json);
+    await req(34568, "POST", "/api/device/sync", syncBody(604, "S9604AAA", [inst(1, pktDate(30), 10000, 10000), inst(2, pktDate(60), 10000, 10000), inst(3, pktDate(90), 10000, 10000)], { status: "completed" }), syncH);
+    r = await checkin(34568, dev604, "S9604AAA");
+    t("O: S9 completed -> permanent_unlock, number absent, total 3", r.json?.instruction === "permanent_unlock" && !("installmentNumber" in (r.json || {})) && r.json?.installmentTotal === 3, r.json);
+    // S14: graceDaysLeft inclusive.
+    await req(34568, "POST", "/api/device/sync", syncBody(605, "S14605AA", [inst(1, pktDate(-5), 10000)]), syncH);
+    r = await register(34568, "S14605AA");
+    r = await checkin(34568, r.json.deviceId, "S14605AA");
+    t("O: PU-S14 aakhri grace din -> warn + graceDaysLeft 1", r.json?.instruction === "warn" && r.json?.graceDaysLeft === 1, r.json);
+    await req(34568, "POST", "/api/device/sync", syncBody(606, "S14606AA", [inst(1, pktDate(-6), 10000)]), syncH);
+    r = await register(34568, "S14606AA");
+    r = await checkin(34568, r.json.deviceId, "S14606AA");
+    t("O: S14 grace guzri (1 din) -> lock_now + graceDaysLeft 0", r.json?.instruction === "lock_now" && r.json?.graceDaysLeft === 0, r.json);
+    // N4: addMonths 31 tareekh par overflow nahi karta.
+    r = await req(34568, "POST", "/api/test/seed", { total: 30000, months: 3, graceDays: 5, firstDueDate: "2026-01-31" }, seedH);
+    const jan31Id = r.json.accountId;
+    r = await req(34568, "GET", "/api/test/accounts", undefined, seedH);
+    const jan31 = r.json?.installments?.filter((i) => i.accountId === jan31Id).map((i) => i.dueDate);
+    t("O: PU-N4 Jan 31 +1 = Feb 28, +2 = Mar 31", JSON.stringify(jan31) === JSON.stringify(["2026-01-31", "2026-02-28", "2026-03-31"]), jan31);
+    r = await req(34568, "POST", "/api/test/seed", { total: 20000, months: 2, graceDays: 5, firstDueDate: "2026-03-31" }, seedH);
+    const mar31Id = r.json.accountId;
+    r = await req(34568, "GET", "/api/test/accounts", undefined, seedH);
+    const mar31 = r.json?.installments?.filter((i) => i.accountId === mar31Id).map((i) => i.dueDate);
+    t("O: N4 Mar 31 +1 = Apr 30", JSON.stringify(mar31) === JSON.stringify(["2026-03-31", "2026-04-30"]), mar31);
+    await stopServer(server); server = null;
+
+    // ---- Server I: PU-S10 rate limiting + salted hash ----
+    console.log("\n== P. PU-S10 rate limiting + salted hash ==");
+    const dataI = join(dir, "i.json");
+    server = await startServer({ port: 34569, dataFile: dataI, seedToken: SEED, syncToken: SYNC });
+    // Register: 10 ghalat koshishen ek IP se -> 11th 429.
+    const badIp = { "x-forwarded-for": "203.0.113.1" };
+    let lastErr = "";
+    for (let i = 0; i < 10; i++) {
+      r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
+      lastErr = r.json?.error;
+    }
+    t("P: 10 ghalat register -> invalid_pairing_code (rok nahi)", lastErr === "invalid_pairing_code", lastErr);
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
+    t("P: PU-S10 11th koshish -> 429 too_many_attempts", r.status === 429 && r.json?.error === "too_many_attempts" && typeof r.json?.message === "string", r.json);
+    // Doosri IP rok mein nahi hai.
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": "203.0.113.2" });
+    t("P: doosri IP par rok nahi (per-IP)", r.status === 200 && r.json?.error === "invalid_pairing_code", r.json);
+    // Sahi code bhi blocked IP se nahi chalta.
+    await req(34569, "POST", "/api/device/sync", syncBody(701, "RL701AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL701A" }), syncH);
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "RL701AAA", imei: "1", model: "X", androidVersion: "14" }, badIp);
+    t("P: blocked IP se sahi code bhi 429", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
+    r = await register(34569, "RL701AAA");
+    const dev701 = r.json.deviceId;
+    t("P: doosri IP (default) se register ok", r.json?.ok === true, r.json);
+    // Restart ke baad bhi rok qaim (data.json mein mehfooz).
+    await stopServer(server);
+    server = await startServer({ port: 34569, dataFile: dataI, seedToken: SEED, syncToken: SYNC });
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
+    t("P: restart ke baad bhi 429 (rate limit data.json mein)", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
+    // offline-code-used: 10 ghalat code ek device se -> 11th 429.
+    const ocuIp = { "x-forwarded-for": "203.0.113.10" };
+    r = await checkin(34569, dev701, "RL701AAA");
+    t("P: locked account checkin -> lock_now + code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "RL701A", r.json);
+    for (let i = 0; i < 10; i++) {
+      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "WRONG1" }, ocuIp);
+      lastErr = r.json?.error;
+    }
+    t("P: 10 ghalat code -> invalid_unlock_code", lastErr === "invalid_unlock_code", lastErr);
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "RL701A" }, ocuIp);
+    t("P: PU-S10 11th code koshish -> 429 (sahi code bhi blocked)", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
+    // Doosra device (doosri IP) rok mein nahi hai.
+    await req(34569, "POST", "/api/device/sync", syncBody(702, "RL702AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL702A" }), syncH);
+    r = await register(34569, "RL702AAA");
+    const dev702 = r.json.deviceId;
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev702, code: "WRONG1" }, { "x-forwarded-for": "203.0.113.11" });
+    t("P: doosra device rok mein nahi (per-device)", r.status === 200 && r.json?.error === "invalid_unlock_code", r.json);
+    // Kamyab code counter saaf kar deta hai: 9 ghalat -> sahi -> 9 ghalat (rok nahi).
+    await req(34569, "POST", "/api/device/sync", syncBody(703, "RL703AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL703A" }), syncH);
+    r = await register(34569, "RL703AAA");
+    const dev703 = r.json.deviceId;
+    const clrIp = { "x-forwarded-for": "203.0.113.12" };
+    for (let i = 0; i < 9; i++) await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" }, clrIp);
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "RL703A" }, clrIp);
+    t("P: 9 ghalat ke baad sahi code chalta hai", r.json?.ok === true, r.json);
+    // Dobara lock karein (naya code) taake 9 ghalat dobara try ho sakein.
+    await req(34569, "POST", "/api/device/sync", syncBody(703, "RL703AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL703B" }), syncH);
+    let blocked = false;
+    for (let i = 0; i < 9; i++) {
+      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" }, clrIp);
+      if (r.status === 429) blocked = true;
+    }
+    t("P: kamyabi ke baad counter saaf — 9 ghalat dobara rok nahi", blocked === false, blocked);
+    // Salted hash: seed account ka code sirf pehli lock_now mein milta hai.
+    r = await req(34569, "POST", "/api/test/seed", { total: 10000, months: 1, graceDays: 5, firstDueDate: pktDate(-10) }, seedH);
+    const seedCode2 = r.json.pairingCode;
+    const seedId2 = r.json.accountId;
+    r = await register(34569, seedCode2);
+    const devSeed2 = r.json.deviceId;
+    r = await checkin(34569, devSeed2, seedCode2);
+    const firstCode = r.json?.offlineUnlockCode;
+    t("P: seed pehli lock_now WITH server code", r.json?.instruction === "lock_now" && typeof firstCode === "string" && /^[A-Z2-9]{6}$/.test(firstCode), r.json);
+    r = await checkin(34569, devSeed2, seedCode2);
+    t("P: PU-S10 seed doosri lock_now code ke BAGHAIR (phone ke paas hash hai)", r.json?.instruction === "lock_now" && !("offlineUnlockCode" in (r.json || {})), r.json);
+    r = await req(34569, "GET", "/api/test/accounts", undefined, seedH);
+    const seedAcct2 = r.json?.accounts?.find((a) => a.id === seedId2);
+    t("P: seed code data mein salted hash hai, plaintext nahi", typeof seedAcct2?.unlockCodeHash === "string" && seedAcct2.unlockCodeHash.includes(":") && seedAcct2.unlockCode === "", seedAcct2);
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: devSeed2, code: firstCode });
+    t("P: seed code hash se verify ho kar chalta hai", r.json?.ok === true && typeof r.json?.offlineUnlockUntil === "string", r.json);
     await stopServer(server); server = null;
   } finally {
     await stopServer(server);

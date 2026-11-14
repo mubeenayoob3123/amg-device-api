@@ -1,4 +1,5 @@
-// AMG Device API — unified device API v2 (unification, 15 Nov 2026)
+// AMG Device API — unified device API v2.1 (UAT fixes, 15 Nov 2026)
+// Health version: "unified-2".
 // ============================================================
 // Phone wali lock app (lock-app/app/.../ServerApi.kt) is server se
 // EXACTLY ye 3 raaste mangti hai — in ka contract KABHI nahi badlega:
@@ -32,8 +33,15 @@
 // Teenon par x-amg-sync header mein AMG_SYNC_TOKEN lagta hai.
 //   - Sync sirf dashboard-side fields badalta hai (qistein, lockState,
 //     unlockCode, status...). Phone-side fields — deviceId,
-//     deviceRegistered, deviceName, imei, lastSeenAt,
-//     offlineUnlockUntil, offlineCodeUsed — sync se KABHI nahi badalte.
+//     deviceRegistered, deviceName, imei, lastSeenAt — sync se KABHI
+//     nahi badalte. v2.1 mein DO istisna hain (PU-M5): sync body mein
+//     saaf taur par bheji gayi offlineUnlockUntil / offlineCodeUsed
+//     RESTORE ho jati hain (wipe ke baad dashboard ki adopted window
+//     wapas aati hai); na bheji jayein to purani qeemat rehti hai.
+//   - v2.1 (PU-M1): sync mein purane se MUKHTALIF unlockCode aaye to
+//     naya lock cycle hai — offlineCodeUsed reset, window saaf.
+//   - v2.1 (PU-M3): sync mein lockState locked aaye to window HAMESHA
+//     saaf ho jati hai — dukaan ka saaf lock window se oopar hai.
 //   - Synced account ka offline unlock code sirf dashboard deta hai;
 //     server synced accounts ke liye apna code KABHI nahi banata
 //     (server code sirf /api/test/seed wale test accounts ke liye hai).
@@ -45,6 +53,17 @@
 //     to check-in grace ke baad bhi AUTO-lock nahi lagata (warning phir
 //     bhi lagti hai, dashboard policy jaisa); manual lock hamesha kaam
 //     karta hai.
+//   - v2.1 (PU-M8): resetPin sync se aata hai aur register ke jawab
+//     mein phone ko milta hai; dobara register par guard hai (purana
+//     deviceId ya naya pairing code zaroori hai), lastReregisterAt
+//     status mein milta hai.
+//   - v2.1 (PU-S10): register + offline-code-used par rate limit hai
+//     (10 ghalat koshishen/ghanta -> 1 ghante ki rok, data.json mein
+//     mehfooz, restart ke baad bhi qaim); seed accounts ka code salted
+//     hash mein rehta hai, plaintext sirf aik dafa bheja jata hai.
+//   - v2.1 (PU-S9/S14/N4): check-in mein installmentNumber +
+//     installmentTotal; graceDaysLeft inclusive (aakhri din = 1);
+//     addMonths 31 tareekh par overflow nahi karta.
 //   - data.json mit jaye (Render free restart) to haath se theek NAHI
 //     karna — dashboard se sync-all dobara chalayein, replica khud
 //     dobara ban jata hai. (Phone ko dobara register karna par sakta
@@ -66,7 +85,7 @@
 //     accounts dobara banane parte hain.
 import { createServer } from "node:http";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -86,13 +105,29 @@ function load() {
   if (!data || !Array.isArray(data.accounts) || !Array.isArray(data.installments)) {
     data = { accounts: [], installments: [], nextAccountId: 1, nextInstallmentId: 1 };
   }
-  // Purani data.json (v1) ke accounts mein naye fields nahi hote —
+  // Purani data.json (v1/v2) ke accounts mein naye fields nahi hote —
   // default laga dein taake purana data bhi chal jaye.
   for (const a of data.accounts) {
     if (a.dashboardAccountId === undefined) a.dashboardAccountId = null;
     if (a.offlineCodeUsed === undefined) a.offlineCodeUsed = 0;
     if (a.autoLock === undefined) a.autoLock = true;
+    if (a.resetPin === undefined) a.resetPin = "";
+    // PU-M8: pehle se registered account ka registeredWithCode us ka
+    // maujooda pairing code hai (dobara register ka guard isi se
+    // pehchanta hai ke code dobara bana hai ya wohi purana hai).
+    if (a.registeredWithCode === undefined) a.registeredWithCode = a.deviceRegistered ? a.pairingCode : "";
+    if (a.lastReregisterAt === undefined) a.lastReregisterAt = "";
+    if (a.unlockCodeHash === undefined) a.unlockCodeHash = "";
+    // PU-S10: purane seed accounts ka plaintext code salted hash mein
+    // badal dein (synced accounts ka code dashboard ka hota hai — wo
+    // plaintext hi rehta hai, kyunke server use har lock_now mein
+    // wapas bhejta hai; seed code sirf aik dafa bheja jata hai).
+    if (a.dashboardAccountId == null && a.unlockCode && !a.unlockCodeHash) {
+      a.unlockCodeHash = hashCode(a.unlockCode);
+      a.unlockCode = "";
+    }
   }
+  if (!data.rateLimits || typeof data.rateLimits !== "object") data.rateLimits = {};
   if (!data.nextAccountId) data.nextAccountId = 1;
   if (!data.nextInstallmentId) data.nextInstallmentId = 1;
   return data;
@@ -121,9 +156,17 @@ function addDays(dateStr, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
+// PU-N4 fix: mahine ke aakhri din se overflow nahi hona chahiye —
+// Jan 31 + 1 mahina = Feb 28 (pehle Mar 3 ban jata tha, kyunke
+// setUTCMonth seedha Feb 31 banata hai jo Mar 3 mein overflow hota hai).
+// Din ko target mahine ke aakhri din par clamp kar dete hain.
 function addMonths(dateStr, months) {
   const d = new Date(dateStr + "T00:00:00Z");
+  const day = d.getUTCDate();
+  d.setUTCDate(1);
   d.setUTCMonth(d.getUTCMonth() + months);
+  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, lastDay));
   return d.toISOString().slice(0, 10);
 }
 function daysBetween(a, b) { // b - a in whole days
@@ -151,7 +194,68 @@ function overdueInfo(acctId, today) {
     overdueAmount: overdue.reduce((s, i) => s + (i.amount - i.paidAmount), 0),
     overdueDueDate: overdue.length ? overdue[0].dueDate : "",
     overdueCount: overdue.length,
+    // PU-S9: pehli overdue qist ka number ("Qist #3 of 6" ke liye).
+    firstOverdueSeq: overdue.length ? overdue[0].seq : null,
   };
+}
+
+// ---- PU-S10: salted hash (server-generated seed codes ke liye) ----
+// Seed accounts ka offline code data.json mein plaintext NAHI rehta —
+// salted SHA-256 hash rehta hai ("salt:hash"). Code sirf us check-in
+// ke jawab mein plaintext milta hai jis ne use banaya (phone us ka
+// hash apne paas mehfooz kar leta hai — OfflineCodeStore); baad ki
+// check-ins code dobara nahi bhejti. Synced accounts ka code dashboard
+// ka hota hai — server use har lock_now mein wapas bhejta hai, is liye
+// wo plaintext hi rehta hai (hash karne se code bheja hi nahi ja sakta).
+function hashCode(code) {
+  const salt = randomBytes(16).toString("hex");
+  const h = createHash("sha256").update(salt + ":" + String(code).trim().toUpperCase()).digest("hex");
+  return salt + ":" + h;
+}
+function verifyCode(code, stored) {
+  if (!stored || typeof stored !== "string") return false;
+  const idx = stored.indexOf(":");
+  if (idx <= 0) return false;
+  const salt = stored.slice(0, idx);
+  const h = createHash("sha256").update(salt + ":" + String(code).trim().toUpperCase()).digest("hex");
+  return h === stored.slice(idx + 1);
+}
+
+// ---- PU-S10: rate limiting (register + offline-code-used) ----
+// Har key par 1 ghante mein 10 ghalat koshishen -> 1 ghante ki rok.
+// State data.json mein rehti hai, is liye restart ke baad bhi qaim
+// rehti hai. Kamyab koshish counter saaf kar deti hai.
+const RATE_LIMIT_MAX_FAILS = 10;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+const RATE_LIMIT_BLOCK_MS = 60 * 60 * 1000;
+function clientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim().slice(0, 64);
+  return String(req.socket?.remoteAddress || "unknown").slice(0, 64);
+}
+function rateLimitBlocked(key) {
+  const rec = db.rateLimits[key];
+  if (!rec) return false;
+  const now = Date.now();
+  if (rec.blockedUntil && now < rec.blockedUntil) return true;
+  if (rec.blockedUntil || now - rec.firstFailAt > RATE_LIMIT_WINDOW_MS) {
+    delete db.rateLimits[key];
+    save();
+  }
+  return false;
+}
+function rateLimitFail(key) {
+  const now = Date.now();
+  let rec = db.rateLimits[key];
+  if (!rec || now - rec.firstFailAt > RATE_LIMIT_WINDOW_MS) {
+    rec = db.rateLimits[key] = { fails: 0, firstFailAt: now, blockedUntil: 0 };
+  }
+  rec.fails += 1;
+  if (rec.fails >= RATE_LIMIT_MAX_FAILS) rec.blockedUntil = now + RATE_LIMIT_BLOCK_MS;
+  save();
+}
+function rateLimitClear(key) {
+  if (db.rateLimits[key]) { delete db.rateLimits[key]; save(); }
 }
 function send(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -245,6 +349,28 @@ function validateSyncAccount(b) {
     if (typeof b.autoLock !== "boolean") return null;
     autoLock = b.autoLock;
   }
+  // PU-M5: dashboard ki adopted window/latch — wipe ke baad sync-all
+  // se wapas aati hai. Na ho to purani qeemat rehti hai (preserve);
+  // di jaye to server use RESTORE karta hai.
+  let offlineUnlockUntil;
+  if (b.offlineUnlockUntil !== undefined) {
+    if (typeof b.offlineUnlockUntil !== "string") return null;
+    offlineUnlockUntil = b.offlineUnlockUntil.trim();
+    if (offlineUnlockUntil && Number.isNaN(Date.parse(offlineUnlockUntil))) return null;
+  }
+  let offlineCodeUsed;
+  if (b.offlineCodeUsed !== undefined) {
+    if (typeof b.offlineCodeUsed === "boolean") offlineCodeUsed = b.offlineCodeUsed ? 1 : 0;
+    else if (b.offlineCodeUsed === 0 || b.offlineCodeUsed === 1) offlineCodeUsed = b.offlineCodeUsed;
+    else return null;
+  }
+  // PU-M8: reset PIN — dashboard set karta hai, server register ke
+  // jawab mein phone ko wapas deta hai.
+  let resetPin;
+  if (b.resetPin !== undefined) {
+    if (typeof b.resetPin !== "string" || b.resetPin.length > 32) return null;
+    resetPin = b.resetPin.trim();
+  }
   return {
     dashboardAccountId,
     shopId,
@@ -256,6 +382,7 @@ function validateSyncAccount(b) {
     lockState: b.lockState,
     unlockCode,
     autoLock,
+    offlineUnlockUntil, offlineCodeUsed, resetPin,
     installments,
   };
 }
@@ -264,10 +391,13 @@ function validateSyncAccount(b) {
 // nahi, aur /api/test/seed wali ids se bhi nahi.
 // REPLICA RULE: update mein sirf dashboard-side fields badalte hain.
 // Phone-side fields (deviceId, deviceRegistered, deviceName, imei,
-// lastSeenAt, offlineUnlockUntil, offlineCodeUsed) sync se KABHI nahi
-// badalte — wo sirf phone ki register/checkin/offline-code-used se
-// badalte hain. Naye account ke liye pairingCode lazmi hai (warna
-// phone is se register hi nahi ho sakta); na ho to null lautaein.
+// lastSeenAt) sync se KABHI nahi badalte — wo sirf phone ki
+// register/checkin/offline-code-used se badalte hain. v2.1 mein
+// offlineUnlockUntil / offlineCodeUsed DO istisna hain (PU-M5): sync
+// body mein saaf taur par bheji jayein to RESTORE hoti hain (wipe ke
+// baad dashboard ki adopted window wapas aati hai); na bheji jayein
+// to purani qeemat rehti hai. Naye account ke liye pairingCode lazmi
+// hai (warna phone is se register hi nahi ho sakta); na ho to null.
 function upsertSyncedAccount(norm) {
   let acct = db.accounts.find((a) => a.dashboardAccountId === norm.dashboardAccountId);
   if (!acct) {
@@ -285,12 +415,18 @@ function upsertSyncedAccount(norm) {
       lockState: norm.lockState !== undefined ? norm.lockState : "unlocked",
       autoLock: norm.autoLock !== undefined ? norm.autoLock : true,
       unlockCode: norm.unlockCode !== undefined ? norm.unlockCode : "",
-      offlineUnlockUntil: "",
+      unlockCodeHash: "",
+      resetPin: norm.resetPin !== undefined ? norm.resetPin : "",
+      registeredWithCode: "",
+      lastReregisterAt: "",
+      // PU-M5: wipe ke baad sync-all se restored window/latch.
+      offlineUnlockUntil: norm.offlineUnlockUntil !== undefined ? norm.offlineUnlockUntil : "",
       deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
-      offlineCodeUsed: 0,
+      offlineCodeUsed: norm.offlineCodeUsed !== undefined ? norm.offlineCodeUsed : 0,
     };
     db.accounts.push(acct);
   } else {
+    const oldUnlockCode = acct.unlockCode;
     acct.shopId = norm.shopId;
     if (norm.shopName !== undefined) acct.shopName = norm.shopName;
     if (norm.shopPhone !== undefined) acct.shopPhone = norm.shopPhone;
@@ -301,8 +437,25 @@ function upsertSyncedAccount(norm) {
     if (norm.lockState !== undefined) acct.lockState = norm.lockState;
     if (norm.autoLock !== undefined) acct.autoLock = norm.autoLock;
     if (norm.unlockCode !== undefined) acct.unlockCode = norm.unlockCode;
-    // Phone-side fields yahan jaan boojh kar CHHUE NAHI jate (upar dekhein).
+    if (norm.resetPin !== undefined) acct.resetPin = norm.resetPin;
+    // Phone-side fields yahan jaan boojh kar CHHUE NAHI jate (upar dekhein)
+    // — siwaaye neeche wale v2.1 rules ke, jin ki tartib ahem hai:
+    // 1) PU-M5: dashboard ne window/latch saaf taur par bheji ho to
+    //    RESTORE karein (wipe ke baad adopted window wapas aati hai).
+    if (norm.offlineUnlockUntil !== undefined) acct.offlineUnlockUntil = norm.offlineUnlockUntil;
+    if (norm.offlineCodeUsed !== undefined) acct.offlineCodeUsed = norm.offlineCodeUsed;
+    // 2) PU-M1: naya code (purane se mukhtalif) = naya lock cycle —
+    //    latch reset, window saaf. Ye restore KE BAAD chalta hai taake
+    //    naya code aane par latch kabhi purane code ka na reh jaye.
+    if (norm.unlockCode !== undefined && norm.unlockCode !== oldUnlockCode) {
+      acct.offlineCodeUsed = 0;
+      acct.offlineUnlockUntil = "";
+    }
   }
+  // 3) PU-M3 (naye + purane dono): lockState locked ho to window
+  //    HAMESHA saaf — dukaan ka saaf lock window se oopar hai, is
+  //    liye agli check-in lock_now degi, stay_unlocked nahi.
+  if (norm.lockState === "locked") acct.offlineUnlockUntil = "";
   // Qistein hamesha poori tarah badal dein — dashboard ki allocation
   // (overpayment samet) hi sach hai, server ki koi doosri raaye nahi.
   db.installments = db.installments.filter((i) => i.accountId !== acct.id);
@@ -317,7 +470,7 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return send(res, 200, {
-        ok: true, service: "amg-device-api", version: "unified-1",
+        ok: true, service: "amg-device-api", version: "unified-2",
         accounts: db.accounts.length,
         syncedAccounts: db.accounts.filter((a) => a.dashboardAccountId != null).length,
       });
@@ -328,17 +481,45 @@ const server = createServer(async (req, res) => {
     // jaisay v1 mein thay — lock app mein koi tabdeeli nahi aayi.
     if (req.method === "POST" && url.pathname === "/api/device/register") {
       const b = await readJson(req);
+      // PU-S10: aik IP se 10 ghalat register koshishen -> 1 ghante ki rok.
+      const ipKey = "reg:" + clientIp(req);
+      if (rateLimitBlocked(ipKey)) {
+        return send(res, 429, { ok: false, error: "too_many_attempts", message: "Bahut zyada ghalat koshishen — 1 ghante baad dobara koshish karein." });
+      }
       const code = String(b.pairingCode || "").trim().toUpperCase();
       const acct = db.accounts.find((a) => a.pairingCode.toUpperCase() === code);
-      if (!acct) return send(res, 200, { ok: false, error: "invalid_pairing_code" });
+      if (!acct) { rateLimitFail(ipKey); return send(res, 200, { ok: false, error: "invalid_pairing_code" }); }
+      // PU-M8: dobara register ka guard — pehle se registered account
+      // par sirf tab jab (a) phone apna purana deviceId dikhaye, ya
+      // (b) pairing code us code se mukhtalif ho jis se aakhri dafa
+      // register hua tha (matlab dukaan ne code dobara banaya hai).
+      // Warna koi bhi phone utha kar registration hijack kar sakta tha.
+      // (Wipe ke baad deviceRegistered 0 hota hai, is liye dobara
+      // register usi code se khula rehta hai — PU-M5 ka flow.)
+      const alreadyRegistered = acct.deviceRegistered === 1 && acct.deviceId;
+      const presentedDeviceId = String(b.deviceId || "").trim();
+      if (alreadyRegistered) {
+        const sameDevice = presentedDeviceId && presentedDeviceId === acct.deviceId;
+        const freshCode = code !== (acct.registeredWithCode || "");
+        if (!sameDevice && !freshCode) {
+          rateLimitFail(ipKey);
+          return send(res, 403, { ok: false, error: "reregister_blocked", message: "Is phone ko dobara register karne ke liye dukaan se naya pairing code lein." });
+        }
+        acct.lastReregisterAt = new Date().toISOString();
+      }
       const deviceId = "dev_" + randomBytes(6).toString("hex");
       acct.deviceId = deviceId;
       acct.deviceRegistered = 1;
+      acct.registeredWithCode = code;
       acct.deviceName = String(b.model || "Android phone").slice(0, 80);
       acct.imei = String(b.imei || "");
       acct.lastSeenAt = new Date().toISOString();
+      rateLimitClear(ipKey);
       save();
-      return send(res, 200, { ok: true, deviceId, accountId: acct.id, shopName: acct.shopName, shopPhone: acct.shopPhone });
+      // PU-M8: reset PIN phone ko milta hai taake reset ke waqt wo
+      // PIN maang sake (PIN dashboard ne sync se set kiya hota hai;
+      // na set ho to khaali string aati hai).
+      return send(res, 200, { ok: true, deviceId, accountId: acct.id, shopName: acct.shopName, shopPhone: acct.shopPhone, resetPin: acct.resetPin || "" });
     }
 
     if (req.method === "POST" && url.pathname === "/api/device/checkin") {
@@ -377,14 +558,38 @@ const server = createServer(async (req, res) => {
       } else if (acct.lockState === "locked") {
         // Manual lock kabhi khud nahi khulta — sirf payment ya offline code se.
         instruction = "lock_now";
-        if (!isSynced && !acct.unlockCode) acct.unlockCode = genCode(6);
-        offlineUnlockCode = acct.unlockCode || null;
+        if (isSynced) {
+          // PU-S7: code pehle hi istemal ho chuka ho to dobara nahi
+          // bhejte — phone ke paas wohi purana code dobara aata to
+          // customer use dobara likhne ki koshish karta. Naya code
+          // agli sync se aata hai.
+          offlineUnlockCode = acct.offlineCodeUsed === 1 ? null : (acct.unlockCode || null);
+        } else if (!acct.unlockCodeHash) {
+          // Seed account, abhi koi code nahi: naya code banayein —
+          // salted hash mehfooz karein, plaintext SIRF isi jawab mein
+          // bhejein (phone us ka hash apne paas rakh leta hai).
+          const fresh = genCode(6);
+          acct.unlockCodeHash = hashCode(fresh);
+          acct.offlineCodeUsed = 0;
+          acct.offlineUnlockUntil = "";
+          offlineUnlockCode = fresh;
+        }
+        // Seed account jiss ka code pehle hi issue ho chuka hai: phone
+        // ke paas us ka hash hai, dobara bhejne ki zaroorat nahi.
       } else if (next && today > addDays(next.dueDate, acct.graceDays) && acct.autoLock !== false) {
         // autoLock off ho (dashboard ki lock-policy setting) to grace ke
         // baad bhi AUTO-lock nahi — neeche warning branch chalegi.
         acct.lockState = "locked";
-        if (!isSynced) acct.unlockCode = genCode(6);
-        offlineUnlockCode = acct.unlockCode || null;
+        if (isSynced) {
+          // PU-S7: istemal shuda code dobara nahi bhejte (upar dekhein).
+          offlineUnlockCode = acct.offlineCodeUsed === 1 ? null : (acct.unlockCode || null);
+        } else {
+          const fresh = genCode(6);
+          acct.unlockCodeHash = hashCode(fresh);
+          acct.offlineCodeUsed = 0;
+          acct.offlineUnlockUntil = "";
+          offlineUnlockCode = fresh;
+        }
         instruction = "lock_now";
       } else if (next && today >= next.dueDate) {
         acct.lockState = "warned";
@@ -394,12 +599,20 @@ const server = createServer(async (req, res) => {
       }
       acct.lastSeenAt = new Date().toISOString();
       save();
-      const graceDaysLeft = next ? Math.max(0, daysBetween(today, addDays(next.dueDate, acct.graceDays))) : 0;
+      // PU-S14: graceDaysLeft INCLUSIVE hai — aakhri grace din par 1
+      // dikhaye, 0 nahi ("0 din baqi" ghalat tha, phone abhi grace mein tha).
+      const graceDaysLeft = next ? Math.max(0, daysBetween(today, addDays(next.dueDate, acct.graceDays)) + 1) : 0;
+      // PU-S9: lock screen "Qist #3 of 6" dikhaye — overdue qist ka
+      // number (na ho to agli baqi qist ka) + kul qiston ki tadad.
+      const installmentTotal = db.installments.filter((i) => i.accountId === acct.id).length;
+      const installmentNumber = overdue.firstOverdueSeq != null ? overdue.firstOverdueSeq : (next ? next.seq : null);
       return send(res, 200, {
         ok: true, instruction,
         dueDate: next ? next.dueDate : "",
         remainingAmount: remaining,
         graceDaysLeft,
+        installmentTotal,
+        ...(installmentNumber != null ? { installmentNumber } : {}),
         shopName: acct.shopName, shopPhone: acct.shopPhone,
         // Wave 3.5 (F-21): per-installment overdue hisaab — lock screen
         // "Rs 10,000 ki qist baqi hai" dikhaye, poora balance nahi.
@@ -419,20 +632,42 @@ const server = createServer(async (req, res) => {
       // S-C1 fix: khaali/missing deviceId pehle hi reject karein (checkin jaisa).
       const deviceId = String(b.deviceId || "").trim();
       if (!deviceId) return send(res, 200, { ok: false, error: "device_not_registered" });
+      // PU-S10: aik device ya aik IP se 10 ghalat code koshishen ->
+      // 1 ghante ki rok (code guess karne wale ko rokne ke liye).
+      const devKey = "ocu:" + deviceId;
+      const ipKey = "ocu-ip:" + clientIp(req);
+      if (rateLimitBlocked(devKey) || rateLimitBlocked(ipKey)) {
+        return send(res, 429, { ok: false, error: "too_many_attempts", message: "Bahut zyada ghalat koshishen — 1 ghante baad dobara koshish karein." });
+      }
       const acct = db.accounts.find((a) => a.deviceId === deviceId);
-      if (!acct) return send(res, 200, { ok: false, error: "device_not_registered" });
-      if (acct.lockState !== "locked" || !acct.unlockCode ||
-          String(b.code || "").trim().toUpperCase() !== acct.unlockCode.toUpperCase()) {
+      if (!acct) { rateLimitFail(ipKey); return send(res, 200, { ok: false, error: "device_not_registered" }); }
+      const typedCode = String(b.code || "").trim().toUpperCase();
+      // PU-S7: maujooda code ka latch laga ho to code pehle hi istemal
+      // ho chuka hai — dobara kabhi nahi chal sakta (wipe-restore ke
+      // baad bhi nahi, jahan code wapas aata hai).
+      // Seed accounts ka code salted hash se milta hai, synced ka
+      // dashboard wale plaintext code se.
+      const codeOk = acct.dashboardAccountId != null
+        ? (Boolean(acct.unlockCode) && typedCode === acct.unlockCode.toUpperCase())
+        : verifyCode(typedCode, acct.unlockCodeHash);
+      if (acct.lockState !== "locked" || acct.offlineCodeUsed === 1 || !codeOk) {
+        rateLimitFail(devKey);
+        rateLimitFail(ipKey);
         return send(res, 200, { ok: false, error: "invalid_unlock_code" });
       }
       acct.lockState = "unlocked";
       acct.unlockCode = "";
+      acct.unlockCodeHash = "";
       // Code istemal ho gaya — dashboard /api/device/status se ye flag
-      // dekh sakta hai. Ye flag sync se kabhi nahi badalta (latch hai).
+      // dekh sakta hai. Ye flag sync se kabhi nahi badalta (latch hai)
+      // — siwaaye v2.1 ke: naya code aane par reset, ya dashboard ki
+      // saaf restore (PU-M1/PU-M5).
       acct.offlineCodeUsed = 1;
       // D-M6 fix: code istemal par 24 ghante ki unlock window shuru hoti
       // hai — is doran check-in stay_unlocked deta hai (upar dekhein).
       acct.offlineUnlockUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      rateLimitClear(devKey);
+      rateLimitClear(ipKey);
       save();
       return send(res, 200, { ok: true, offlineUnlockUntil: acct.offlineUnlockUntil });
     }
@@ -520,6 +755,9 @@ const server = createServer(async (req, res) => {
         status: acct.status,
         offlineCodeUsed: acct.offlineCodeUsed === 1,
         offlineUnlockUntil: acct.offlineUnlockUntil || "",
+        // PU-M8: aakhri dobara-register ka waqt (dashboard Device Lock
+        // tab mein dikhaye — hijack ki nishani ho sakti hai).
+        lastReregisterAt: acct.lastReregisterAt || "",
       });
     }
 
@@ -541,7 +779,8 @@ const server = createServer(async (req, res) => {
         shopPhone: String(b.shopPhone || ""), customerName: String(b.customerName || "Test Customer"),
         pairingCode: genCode(8), graceDays, status: "active", lockState: "unlocked",
         autoLock: true,
-        unlockCode: "", offlineUnlockUntil: "", offlineCodeUsed: 0,
+        unlockCode: "", unlockCodeHash: "", offlineUnlockUntil: "", offlineCodeUsed: 0,
+        resetPin: "", registeredWithCode: "", lastReregisterAt: "",
         deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
       };
       db.accounts.push(acct);
@@ -565,10 +804,10 @@ const server = createServer(async (req, res) => {
         const pay = Math.min(due, left);
         inst.paidAmount += pay; left -= pay;
       }
-      if (outstanding(acct.id) === 0) { acct.status = "completed"; acct.lockState = "unlocked"; acct.unlockCode = ""; }
+      if (outstanding(acct.id) === 0) { acct.status = "completed"; acct.lockState = "unlocked"; acct.unlockCode = ""; acct.unlockCodeHash = ""; }
       else if (acct.lockState === "locked") {
         const next = nextUnpaid(acct.id);
-        if (next && todayStr() <= addDays(next.dueDate, acct.graceDays)) { acct.lockState = "unlocked"; acct.unlockCode = ""; }
+        if (next && todayStr() <= addDays(next.dueDate, acct.graceDays)) { acct.lockState = "unlocked"; acct.unlockCode = ""; acct.unlockCodeHash = ""; }
       }
       save();
       return send(res, 200, { ok: true, accountId: acct.id, status: acct.status, lockState: acct.lockState, outstanding: outstanding(acct.id) });
@@ -590,5 +829,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`AMG device API unified-1 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"})`);
+  console.log(`AMG device API unified-2 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"})`);
 });
