@@ -1,5 +1,8 @@
-// AMG Device API — unified device API v2.1 (UAT fixes, 15 Nov 2026)
-// Health version: "unified-2".
+// AMG Device API — unified device API v2.1 + FCM push (Wave 5.4, 15 Nov 2026)
+// Health version: "unified-3".
+// v2.1 sync contract BILKUL waisa hi hai (sync body mein koi tabdeeli
+// nahi) — FCM sirf phone-API ka izafa hai: register/checkin mein
+// optional fcmToken, aur sync se unlock/completed par push.
 // ============================================================
 // Phone wali lock app (lock-app/app/.../ServerApi.kt) is server se
 // EXACTLY ye 3 raaste mangti hai — in ka contract KABHI nahi badlega:
@@ -65,6 +68,14 @@
 //   - v2.1 (PU-S9/S14/N4): check-in mein installmentNumber +
 //     installmentTotal; graceDaysLeft inclusive (aakhri din = 1);
 //     addMonths 31 tareekh par overflow nahi karta.
+//   - FCM push (Wave 5.4, unified-3): phone register/check-in mein
+//     apna FCM token bhejta hai (optional, phone-side field — sync
+//     isay kabhi nahi chhoota). Jab sync se koi account unlocked ya
+//     completed hota hai to server us token par data-only push
+//     bhejta hai ("check-in karo") taake phone foran khul jaye.
+//     FCM_SERVER_KEY (Render env) set na ho to push band hai —
+//     sync phir bhi theek chalta hai, sirf aik log line aati hai.
+//     Send ka code fcm.mjs mein hai (unit-testable, stubbed fetch).
 //   - data.json mit jaye (Render free restart) to haath se theek NAHI
 //     karna — dashboard se sync-all dobara chalayein, replica khud
 //     dobara ban jata hai. (Phone ko dobara register karna par sakta
@@ -89,12 +100,19 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { sendFcmPush, FCM_DEFAULT_ENDPOINT } from "./fcm.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_FILE = process.env.AMG_DATA_FILE || join(__dirname, "data.json");
 const PORT = Number(process.env.PORT || 3000);
 const SEED_TOKEN = process.env.AMG_SEED_TOKEN || "";
 const SYNC_TOKEN = process.env.AMG_SYNC_TOKEN || "";
+// FCM (Wave 5.4): server key Firebase console se (Render env var).
+// Set na ho to push band hai (no-op + log) — sync theek chalta hai.
+const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY || "";
+// FCM_ENDPOINT SIRF TEST ke liye hai (local stub ki taraf modne ke
+// liye) — Render par kabhi set nahi karna.
+const FCM_ENDPOINT = process.env.FCM_ENDPOINT || FCM_DEFAULT_ENDPOINT;
 
 function load() {
   let data = null;
@@ -119,6 +137,8 @@ function load() {
     if (a.registeredWithCode === undefined) a.registeredWithCode = a.deviceRegistered ? a.pairingCode : "";
     if (a.lastReregisterAt === undefined) a.lastReregisterAt = "";
     if (a.unlockCodeHash === undefined) a.unlockCodeHash = "";
+    // FCM (Wave 5.4): purane accounts mein token nahi hota.
+    if (a.fcmToken === undefined) a.fcmToken = "";
     // PU-S10: purane seed accounts ka plaintext code salted hash mein
     // badal dein (synced accounts ka code dashboard ka hota hai — wo
     // plaintext hi rehta hai, kyunke server use har lock_now mein
@@ -198,6 +218,50 @@ function overdueInfo(acctId, today) {
     // PU-S9: pehli overdue qist ka number ("Qist #3 of 6" ke liye).
     firstOverdueSeq: overdue.length ? overdue[0].seq : null,
   };
+}
+
+// ---- FCM (Wave 5.4): token ki jaanch ----
+// Token optional metadata hai — ghalat ho to register/check-in kabhi
+// fail nahi hota, token bas ignore ho jata hai. FCM token ~150 harf
+// ka hota hai; 1024 ki had sirf ghalat/bohat bara input rokne ke liye hai.
+function validFcmToken(v) {
+  if (typeof v !== "string") return "";
+  const t = v.trim();
+  if (!t || t.length > 1024) return "";
+  return t;
+}
+
+// ---- FCM push (Wave 5.4): sync se unlock/completed par phone ko jagayein ----
+// Fire-and-forget: sync ka jawab is ka intezar NAHI karta, aur push ki
+// koi ghalti sync ko kabhi nahi bigaarti (andar try/catch hai).
+// Sirf TRANSITION par push hota hai — pehle se unlocked account ki
+// dobara sync par nahi (warna har sync par push aata).
+async function maybePushUnlock(acct, prevLockState, prevStatus) {
+  try {
+    const becameUnlocked = acct.lockState === "unlocked" && prevLockState !== null && prevLockState !== "unlocked";
+    const becameCompleted = acct.status === "completed" && prevStatus !== null && prevStatus !== "completed";
+    if (!becameUnlocked && !becameCompleted) return;
+    if (acct.deviceRegistered !== 1) return; // phone abhi register hi nahi hua
+    if (!acct.fcmToken) {
+      console.log(`FCM skip: account ${acct.dashboardAccountId} has no FCM token registered`);
+      return;
+    }
+    if (!FCM_SERVER_KEY) {
+      console.log(`FCM not configured (FCM_SERVER_KEY unset) — skipping push for account ${acct.dashboardAccountId}`);
+      return;
+    }
+    const reason = becameCompleted ? "completed" : "unlocked";
+    const res = await sendFcmPush({
+      serverKey: FCM_SERVER_KEY,
+      token: acct.fcmToken,
+      data: { type: "amg_checkin", reason, dashboardAccountId: String(acct.dashboardAccountId) },
+      endpoint: FCM_ENDPOINT,
+    });
+    if (res.ok) console.log(`FCM push sent (${reason}) to account ${acct.dashboardAccountId}`);
+    else console.log(`FCM push FAILED (${reason}) account ${acct.dashboardAccountId}: ${res.error}`);
+  } catch (e) {
+    console.log(`FCM push error account ${acct.dashboardAccountId}: ${e && e.message ? e.message : "unknown"}`);
+  }
 }
 
 // ---- PU-S10: salted hash (server-generated seed codes ke liye) ----
@@ -424,6 +488,9 @@ function upsertSyncedAccount(norm) {
       offlineUnlockUntil: norm.offlineUnlockUntil !== undefined ? norm.offlineUnlockUntil : "",
       deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
       offlineCodeUsed: norm.offlineCodeUsed !== undefined ? norm.offlineCodeUsed : 0,
+      // FCM token phone-side field hai — sync isay kabhi nahi set
+      // karta; phone register/check-in mein bhejta hai.
+      fcmToken: "",
     };
     db.accounts.push(acct);
   } else {
@@ -474,9 +541,11 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return send(res, 200, {
-        ok: true, service: "amg-device-api", version: "unified-2",
+        ok: true, service: "amg-device-api", version: "unified-3",
         accounts: db.accounts.length,
         syncedAccounts: db.accounts.filter((a) => a.dashboardAccountId != null).length,
+        // FCM (Wave 5.4): server key set hai ya nahi — setup check ke liye.
+        fcmConfigured: Boolean(FCM_SERVER_KEY),
       });
     }
 
@@ -517,6 +586,10 @@ const server = createServer(async (req, res) => {
       acct.registeredWithCode = code;
       acct.deviceName = String(b.model || "Android phone").slice(0, 80);
       acct.imei = String(b.imei || "");
+      // FCM (Wave 5.4): phone apna push token register par bhejta hai
+      // (optional — na bheje to purana token rehta hai).
+      const fcmToken = validFcmToken(b.fcmToken);
+      if (fcmToken) acct.fcmToken = fcmToken;
       acct.lastSeenAt = new Date().toISOString();
       rateLimitClear(ipKey);
       save();
@@ -538,6 +611,10 @@ const server = createServer(async (req, res) => {
       if (b.pairingCode && acct.pairingCode.toUpperCase() !== String(b.pairingCode).trim().toUpperCase()) {
         return send(res, 200, { ok: false, error: "invalid_pairing_code" });
       }
+      // FCM (Wave 5.4): token refresh check-in ke saath aata hai —
+      // naya token ho to update kar dein (neeche save() isay likhta hai).
+      const fcmToken = validFcmToken(b.fcmToken);
+      if (fcmToken && fcmToken !== acct.fcmToken) acct.fcmToken = fcmToken;
       // Synced account = dashboard ki replica. Is ka offline unlock code
       // sirf dashboard deta hai — server is ke liye apna code KABHI nahi
       // banata. Server code sirf /api/test/seed wale accounts ke liye hai.
@@ -685,9 +762,16 @@ const server = createServer(async (req, res) => {
       const b = await readJson(req);
       const norm = validateSyncAccount(b);
       if (!norm) return send(res, 400, { ok: false, error: "invalid_sync_payload" });
+      // FCM: push sirf TRANSITION par hai — upsert se PEHLE purani
+      // halat snapshot karein (upsert usi object ko badalta hai).
+      const prev = db.accounts.find((a) => a.dashboardAccountId === norm.dashboardAccountId);
+      const prevLockState = prev ? prev.lockState : null;
+      const prevStatus = prev ? prev.status : null;
       const acct = upsertSyncedAccount(norm);
       if (!acct) return send(res, 400, { ok: false, error: "invalid_sync_payload" }); // naya account, pairing code nahi
       save();
+      // Fire-and-forget: jawab is ka intezar nahi karta.
+      if (prev) void maybePushUnlock(acct, prevLockState, prevStatus);
       return send(res, 200, { ok: true, accountId: acct.id, dashboardAccountId: acct.dashboardAccountId });
     }
 
@@ -732,13 +816,24 @@ const server = createServer(async (req, res) => {
         .map((a) => a.id);
       db.accounts = db.accounts.filter((a) => !(a.dashboardAccountId != null && a.shopId === shopId && !seenIds.has(a.dashboardAccountId)));
       db.installments = db.installments.filter((i) => !removedIds.includes(i.accountId));
+      // FCM: har account ki purani halat snapshot karein (upsert usi
+      // object ko badalta hai); push sirf poori kamyabi ke baad.
+      const pushJobs = [];
       for (const norm of normed) {
         // upsert update path mein phone-side fields khud bacha leta hai.
-        if (!upsertSyncedAccount(norm)) {
+        const prev = db.accounts.find((a) => a.dashboardAccountId === norm.dashboardAccountId);
+        const prevLockState = prev ? prev.lockState : null;
+        const prevStatus = prev ? prev.status : null;
+        const acct = upsertSyncedAccount(norm);
+        if (!acct) {
           return send(res, 400, { ok: false, error: "invalid_sync_payload" });
         }
+        if (prev) pushJobs.push([acct, prevLockState, prevStatus]);
       }
       save();
+      for (const [acct, prevLockState, prevStatus] of pushJobs) {
+        void maybePushUnlock(acct, prevLockState, prevStatus);
+      }
       return send(res, 200, { ok: true, synced: normed.length });
     }
 
@@ -762,6 +857,9 @@ const server = createServer(async (req, res) => {
         // PU-M8: aakhri dobara-register ka waqt (dashboard Device Lock
         // tab mein dikhaye — hijack ki nishani ho sakti hai).
         lastReregisterAt: acct.lastReregisterAt || "",
+        // FCM (Wave 5.4): is phone ka push token registered hai ya
+        // nahi — dashboard Device Lock tab mein dikha sakta hai.
+        fcmRegistered: Boolean(acct.fcmToken),
       });
     }
 
@@ -786,6 +884,7 @@ const server = createServer(async (req, res) => {
         unlockCode: "", unlockCodeHash: "", offlineUnlockUntil: "", offlineCodeUsed: 0,
         resetPin: "", registeredWithCode: "", lastReregisterAt: "",
         deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
+        fcmToken: "",
       };
       db.accounts.push(acct);
       for (let i = 0; i < months; i++) {
@@ -833,5 +932,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`AMG device API unified-2 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"})`);
+  console.log(`AMG device API unified-3 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"}, fcm ${FCM_SERVER_KEY ? "enabled" : "DISABLED: set FCM_SERVER_KEY"})`);
 });

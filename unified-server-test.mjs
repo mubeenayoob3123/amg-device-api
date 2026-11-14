@@ -1,12 +1,17 @@
-// AMG unified device API v2 — local test battery (plain node, no deps)
+// AMG unified device API v2.1 + FCM (Wave 5.4) — local test battery (plain node, no deps)
 // Chalana:  node unified-server-test.mjs
 // Ye test server ko scratch port + temp data file ke saath chalata hai,
 // live Render server ko haath nahi lagata. Exit code 0 = sab pass.
+// Section Q fcm.mjs ko seedha import karke jaanchta hai (stubbed fetch);
+// section R mein FCM_ENDPOINT aik local stub server ki taraf modha jata
+// hai taake asli push dekha ja sake (koi asli Firebase call nahi hoti).
 import { spawn } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sendFcmPush, FCM_DEFAULT_ENDPOINT } from "./fcm.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, "server.mjs");
@@ -42,11 +47,12 @@ async function req(port, method, path, body, headers = {}) {
 const syncH = { "x-amg-sync": SYNC };
 const seedH = { "x-amg-seed": SEED };
 
-async function startServer({ port, dataFile, seedToken, syncToken }) {
+async function startServer({ port, dataFile, seedToken, syncToken, extraEnv }) {
   const child = spawn(process.execPath, [SERVER_PATH], {
     env: {
       ...process.env, PORT: String(port), AMG_DATA_FILE: dataFile,
       AMG_SEED_TOKEN: seedToken || "", AMG_SYNC_TOKEN: syncToken || "",
+      ...(extraEnv || {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -99,7 +105,7 @@ async function main() {
     r = await req(34561, "GET", "/api/device/status?dashboardAccountId=1", undefined, syncH);
     t("status bina token env -> 403 sync_disabled", r.status === 403 && r.json?.error === "sync_disabled", r.json);
     r = await req(34561, "GET", "/health");
-    t("health version unified-2 + counts", r.json?.version === "unified-2" && r.json?.accounts === 0 && r.json?.syncedAccounts === 0, r.json);
+    t("health version unified-3 + counts + fcmConfigured=false", r.json?.version === "unified-3" && r.json?.accounts === 0 && r.json?.syncedAccounts === 0 && r.json?.fcmConfigured === false, r.json);
     await stopServer(server); server = null;
 
     // ---- Server B: dono tokens set ----
@@ -599,6 +605,134 @@ async function main() {
     r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: devSeed2, code: firstCode });
     t("P: seed code hash se verify ho kar chalta hai", r.json?.ok === true && typeof r.json?.offlineUnlockUntil === "string", r.json);
     await stopServer(server); server = null;
+
+    // ---- Section Q: FCM send unit tests (fcm.mjs, stubbed fetch — koi server nahi) ----
+    console.log("\n== Q. FCM send unit tests (stubbed fetch) ==");
+    let stubCalls = [];
+    const stubOk = async (url, opts) => {
+      stubCalls.push({ url, opts, body: JSON.parse(opts.body) });
+      return { ok: true, status: 200, json: async () => ({ message_id: "0:1234%abc" }) };
+    };
+    let out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", data: { type: "amg_checkin", reason: "unlocked" }, fetchFn: stubOk });
+    t("Q: stub success -> ok + messageId", out.ok === true && out.messageId === "0:1234%abc", out);
+    t("Q: legacy endpoint + key header + high priority + data", stubCalls.length === 1 && stubCalls[0].url === FCM_DEFAULT_ENDPOINT && stubCalls[0].opts.headers.Authorization === "key=key-123" && stubCalls[0].body.to === "tok-1" && stubCalls[0].body.priority === "high" && stubCalls[0].body.data.type === "amg_checkin", stubCalls[0]);
+    const stub401 = async () => ({ ok: false, status: 401, json: async () => ({ error: "InvalidKey" }) });
+    out = await sendFcmPush({ serverKey: "bad-key", token: "tok-1", fetchFn: stub401 });
+    t("Q: FCM 401 -> fcm_http_401", out.ok === false && out.error === "fcm_http_401", out);
+    const stubThrow = async () => { throw new Error("dns fail"); };
+    out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", fetchFn: stubThrow });
+    t("Q: fetch throw -> fcm_network_error (kabhi throw nahi)", out.ok === false && out.error === "fcm_network_error", out);
+    stubCalls = [];
+    out = await sendFcmPush({ serverKey: "", token: "tok-1", fetchFn: stubOk });
+    t("Q: bina server key -> fcm_not_configured, fetch call nahi hota", out.ok === false && out.error === "fcm_not_configured" && stubCalls.length === 0, out);
+    out = await sendFcmPush({ serverKey: "key-123", token: "   ", fetchFn: stubOk });
+    t("Q: khaali token -> no_token", out.ok === false && out.error === "no_token", out);
+    stubCalls = [];
+    out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", endpoint: "http://127.0.0.1:9/stub", fetchFn: stubOk });
+    t("Q: custom endpoint istemal hota hai", out.ok === true && stubCalls[0].url === "http://127.0.0.1:9/stub", stubCalls[0]);
+
+    // ---- Section R: FCM trigger (sync unlock/completed -> push, local stub endpoint) ----
+    console.log("\n== R. FCM trigger: sync unlock/completed -> push ==");
+    const fcmStubPort = 34580;
+    const pushes = [];
+    const fcmStub = createHttpServer((req2, res2) => {
+      let body = "";
+      req2.on("data", (c) => { body += c; });
+      req2.on("end", () => {
+        let parsed = null;
+        try { parsed = JSON.parse(body); } catch { /* ignore */ }
+        pushes.push({ path: req2.url, auth: req2.headers.authorization || "", body: parsed });
+        res2.writeHead(200, { "Content-Type": "application/json" });
+        res2.end(JSON.stringify({ message_id: "0:stub%1" }));
+      });
+    });
+    await new Promise((resolve) => fcmStub.listen(fcmStubPort, "127.0.0.1", resolve));
+    async function waitForPushes(n, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (pushes.length >= n) return true;
+        await new Promise((x) => setTimeout(x, 100));
+      }
+      return pushes.length >= n;
+    }
+    try {
+      const dataR = join(dir, "r.json");
+      const fcmEnv = { FCM_SERVER_KEY: "test-fcm-key", FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/fcm/send` };
+      server = await startServer({ port: 34570, dataFile: dataR, seedToken: SEED, syncToken: SYNC, extraEnv: fcmEnv });
+      r = await req(34570, "GET", "/health");
+      t("R: health fcmConfigured=true (key set hai)", r.json?.fcmConfigured === true, r.json);
+      // R1: locked account + token wala register.
+      await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM801A" }), syncH);
+      r = await req(34570, "POST", "/api/device/register", { pairingCode: "FCM801AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-801" });
+      const dev801 = r.json.deviceId;
+      t("R: register fcmToken ke saath ok", r.json?.ok === true && typeof dev801 === "string", r.json);
+      r = await checkin(34570, dev801, "FCM801AA");
+      t("R: locked checkin -> lock_now", r.json?.instruction === "lock_now", r.json);
+      r = await req(34570, "GET", "/api/device/status?dashboardAccountId=801", undefined, syncH);
+      t("R: status fcmRegistered=true", r.json?.fcmRegistered === true, r.json);
+      // R2: payment sync (unlock) -> push.
+      await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      t("R: unlock sync ke baad push aata hai", await waitForPushes(1), pushes);
+      t("R: push shape — token + key header + data (unlocked)", pushes.length >= 1 && pushes[0].body?.to === "fcm-token-801" && pushes[0].auth === "key=test-fcm-key" && pushes[0].body?.data?.type === "amg_checkin" && pushes[0].body?.data?.reason === "unlocked" && pushes[0].body?.data?.dashboardAccountId === "801" && pushes[0].body?.priority === "high", pushes[0]);
+      // R3: dobara unlocked sync -> koi naya push nahi (transition nahi).
+      await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      await new Promise((x) => setTimeout(x, 500));
+      t("R: dobara unlocked sync par naya push NAHI", pushes.length === 1, pushes.length);
+      // R4: dobara lock, phir completed -> push reason=completed.
+      await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "locked", unlockCode: "FCM801B" }), syncH);
+      await new Promise((x) => setTimeout(x, 300));
+      t("R: lock transition par push NAHI (sirf unlock/completed par)", pushes.length === 1, pushes.length);
+      await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { status: "completed", lockState: "unlocked", unlockCode: "" }), syncH);
+      t("R: completed sync ke baad push aata hai", await waitForPushes(2), pushes);
+      t("R: completed push reason=completed", pushes[1]?.body?.data?.reason === "completed", pushes[1]);
+      // R5: token ke baghair register -> unlock par push nahi.
+      await req(34570, "POST", "/api/device/sync", syncBody(802, "FCM802AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM802A" }), syncH);
+      r = await register(34570, "FCM802AA");
+      await req(34570, "POST", "/api/device/sync", syncBody(802, "FCM802AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      await new Promise((x) => setTimeout(x, 500));
+      t("R: bina token account par push NAHI", pushes.length === 2, pushes.length);
+      r = await req(34570, "GET", "/api/device/status?dashboardAccountId=802", undefined, syncH);
+      t("R: status fcmRegistered=false (bina token)", r.json?.fcmRegistered === false, r.json);
+      // R6: check-in se token update hota hai.
+      await req(34570, "POST", "/api/device/sync", syncBody(803, "FCM803AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM803A" }), syncH);
+      r = await register(34570, "FCM803AA");
+      const dev803 = r.json.deviceId;
+      r = await req(34570, "POST", "/api/device/checkin", { deviceId: dev803, pairingCode: "FCM803AA", fcmToken: "fcm-token-803-new" });
+      t("R: checkin fcmToken ke saath ok", r.json?.ok === true, r.json);
+      await req(34570, "POST", "/api/device/sync", syncBody(803, "FCM803AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      t("R: checkin se mila token par push jata hai", await waitForPushes(3), pushes);
+      t("R: push naye token par gaya", pushes[2]?.body?.to === "fcm-token-803-new", pushes[2]);
+      // R7: token sync se nahi mitta (phone-side field).
+      r = await req(34570, "GET", "/api/test/accounts", undefined, seedH);
+      const acct801 = r.json?.accounts?.find((a) => a.dashboardAccountId === 801);
+      t("R: fcmToken sync ke baad bhi mehfooz hai", acct801?.fcmToken === "fcm-token-801", acct801);
+      // R8: sync-all se unlock -> push bhi chalta hai (sirf transition wala account).
+      await req(34570, "POST", "/api/device/sync", syncBody(804, "FCM804AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM804A" }), syncH);
+      r = await req(34570, "POST", "/api/device/register", { pairingCode: "FCM804AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-804" });
+      await req(34570, "POST", "/api/device/sync-all", { shopId: 1, accounts: [
+        syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { status: "completed", lockState: "unlocked", unlockCode: "" }),
+        syncBody(802, "FCM802AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }),
+        syncBody(803, "FCM803AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }),
+        syncBody(804, "FCM804AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }),
+      ] }, syncH);
+      t("R: sync-all unlock ke baad push aata hai (sirf 804 ka transition)", await waitForPushes(4), pushes);
+      t("R: sync-all push 804 ke token par", pushes[3]?.body?.to === "fcm-token-804" && pushes[3]?.body?.data?.dashboardAccountId === "804", pushes[3]);
+      await stopServer(server); server = null;
+      // R9: FCM key set NAHI — sync theek chalta hai, push nahi aata.
+      const dataR2 = join(dir, "r2.json");
+      server = await startServer({ port: 34571, dataFile: dataR2, seedToken: SEED, syncToken: SYNC, extraEnv: { FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/fcm/send` } });
+      r = await req(34571, "GET", "/health");
+      t("R: bina key health fcmConfigured=false", r.json?.fcmConfigured === false, r.json);
+      await req(34571, "POST", "/api/device/sync", syncBody(901, "FCM901AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM901A" }), syncH);
+      r = await req(34571, "POST", "/api/device/register", { pairingCode: "FCM901AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-901" });
+      r = await req(34571, "POST", "/api/device/sync", syncBody(901, "FCM901AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      t("R: bina key sync phir bhi ok", r.json?.ok === true, r.json);
+      await new Promise((x) => setTimeout(x, 500));
+      t("R: bina key koi push NAHI aata (no-op)", pushes.length === 4, pushes.length);
+      await stopServer(server); server = null;
+    } finally {
+      await new Promise((resolve) => fcmStub.close(resolve));
+    }
   } finally {
     await stopServer(server);
     rmSync(dir, { recursive: true, force: true });
