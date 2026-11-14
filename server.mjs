@@ -9,6 +9,16 @@
 // Jawab bhi phone ki zubaan mein: instruction =
 //   "stay_unlocked" | "warn" | "lock_now" | "permanent_unlock"
 //
+// Wave 3 (14 Nov 2026) — check-in ke jawab mein mazeed fields:
+//   overdueAmount / overdueDueDate / overdueCount — sirf OVERDUE qist
+//   ki raqam aur tareekh (F-21: lock screen "Rs 10,000 ki qist baqi hai"
+//   dikhaye, poora balance nahi); nextDueDate / monthlyAmount — app ki
+//   status screen ke liye; shopPhone — seed mein diya gaya shop ka number.
+// Offline code istemal par 24 ghante ki unlock window (D-M6): is doran
+// check-in stay_unlocked deta hai aur offlineUnlockUntil bhejta hai;
+// window khatam hone par normal policy wapas (dobara lock, agar overdue).
+// Purane fields sab waisay hi hain — purani app bhi chalti rahe gi.
+//
 // AHEM NOTE: Dashboard (Hatch artifact, ts-spaces/amg-dashboard) ke
 // andar ye kaam actions ke tor par hai (registerDevice / deviceCheckin),
 // lekin un ki shakal phone wali se mukhtalif hai:
@@ -96,6 +106,20 @@ function outstanding(acctId) {
     .filter((i) => i.accountId === acctId)
     .reduce((s, i) => s + (i.amount - i.paidAmount), 0);
 }
+function overdueInfo(acctId, today) {
+  // Wave 3.5 (F-21): lock screen ko poori baqi raqam nahi, sirf OVERDUE
+  // qist ki raqam dikhani hai ("Rs 10,000 ki qist baqi hai") — is liye
+  // overdue qiston ka hisaab alag se. Overdue = due date guzar chuki ho
+  // aur qist poori ada na hui ho.
+  const overdue = db.installments
+    .filter((i) => i.accountId === acctId && i.paidAmount < i.amount && i.dueDate < today)
+    .sort((a, b) => a.seq - b.seq);
+  return {
+    overdueAmount: overdue.reduce((s, i) => s + (i.amount - i.paidAmount), 0),
+    overdueDueDate: overdue.length ? overdue[0].dueDate : "",
+    overdueCount: overdue.length,
+  };
+}
 function send(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
@@ -152,10 +176,20 @@ const server = createServer(async (req, res) => {
       const today = todayStr();
       const next = nextUnpaid(acct.id);
       const remaining = outstanding(acct.id);
+      const overdue = overdueInfo(acct.id, today);
       let instruction;
       let offlineUnlockCode = null;
+      // D-M6 fix: offline code istemal ke baad 24 ghante ki unlock window —
+      // is doran check-in stay_unlocked deta hai. Pehle agli hi check-in
+      // (15 minute baad) dobara lock kar deti thi, code ka faida sirf
+      // ~15 minute tha. Window khatam hone par normal policy wapas aati
+      // hai — agar qist abhi bhi overdue hai to dobara lock ho jata hai.
+      const windowActive = Boolean(acct.offlineUnlockUntil) && new Date(acct.offlineUnlockUntil) > new Date();
+      if (acct.offlineUnlockUntil && !windowActive) acct.offlineUnlockUntil = ""; // guzri hui window saaf karein
       if (acct.status === "completed") {
         instruction = "permanent_unlock";
+      } else if (windowActive) {
+        instruction = "stay_unlocked";
       } else if (acct.lockState === "locked") {
         // Manual lock kabhi khud nahi khulta — sirf payment ya offline code se.
         instruction = "lock_now";
@@ -181,7 +215,16 @@ const server = createServer(async (req, res) => {
         remainingAmount: remaining,
         graceDaysLeft,
         shopName: acct.shopName, shopPhone: acct.shopPhone,
+        // Wave 3.5 (F-21): per-installment overdue hisaab — lock screen
+        // "Rs 10,000 ki qist baqi hai" dikhaye, poora balance nahi.
+        overdueAmount: overdue.overdueAmount,
+        overdueDueDate: overdue.overdueDueDate,
+        overdueCount: overdue.overdueCount,
+        nextDueDate: next ? next.dueDate : "",
+        monthlyAmount: next ? next.amount : 0,
         ...(offlineUnlockCode ? { offlineUnlockCode } : {}),
+        // D-M6: active 24h unlock window ki akhri tareekh (app dikha sakta hai).
+        ...(windowActive ? { offlineUnlockUntil: acct.offlineUnlockUntil } : {}),
       });
     }
 
@@ -198,8 +241,11 @@ const server = createServer(async (req, res) => {
       }
       acct.lockState = "unlocked";
       acct.unlockCode = "";
+      // D-M6 fix: code istemal par 24 ghante ki unlock window shuru hoti
+      // hai — is doran check-in stay_unlocked deta hai (upar dekhein).
+      acct.offlineUnlockUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
       save();
-      return send(res, 200, { ok: true });
+      return send(res, 200, { ok: true, offlineUnlockUntil: acct.offlineUnlockUntil });
     }
 
     // ---- Sirf TEST ke liye (seed token zaroori) ----
@@ -216,7 +262,7 @@ const server = createServer(async (req, res) => {
         id: db.nextAccountId++, shopName: String(b.shopName || "Al Arab Electronic"),
         shopPhone: String(b.shopPhone || ""), customerName: String(b.customerName || "Test Customer"),
         pairingCode: genCode(8), graceDays, status: "active", lockState: "unlocked",
-        unlockCode: "", deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
+        unlockCode: "", offlineUnlockUntil: "", deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
       };
       db.accounts.push(acct);
       for (let i = 0; i < months; i++) {

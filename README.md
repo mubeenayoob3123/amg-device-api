@@ -19,6 +19,16 @@ Apni machine par chala kar ye sab test kiya — sab theek chala:
 5. **Ghalat offline code** → nahi khulta. **Sahi code** → khul jata hai.
 6. **Poori qist ada** → `permanent_unlock`, phone hamesha ke liye khul jata hai.
 
+## Wave 3 (14 November 2026) — naya kya hai?
+
+7. **Check-in ab overdue qist ki raqam alag se bhejta hai** — `overdueAmount`,
+   `overdueDueDate`, `overdueCount`, `nextDueDate`, `monthlyAmount` — taake lock
+   screen "Rs 10,000 ki qist baqi hai" dikhaye, poora baqi balance nahi.
+8. **Offline code ab 24 ghante ka unlock deta hai** — pehle agli check-in
+   (15 minute baad) dobara lock kar deti thi. Ab code istemal par 24 ghante
+   ki window shuru hoti hai, is doran phone unlocked rehta hai; window khatam
+   hone par agar qist abhi bhi overdue hai to dobara lock ho jata hai.
+
 ## Ek zaroori sach — jo pehle saaf nahi tha
 
 Dashboard (jo abhi bana hua hai) ke andar lock ka kaam actions ke tor par hai,
