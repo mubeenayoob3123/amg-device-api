@@ -26,7 +26,8 @@
 // dashboard se baat NAHI kar sakta). Dashboard apne device state ko
 // sync endpoints se yahan bhejta hai:
 //   POST /api/device/sync            (aik account ka device state)
-//   POST /api/device/sync-all        (tamam synced accounts, poora replace)
+//   POST /api/device/sync-all        (AIK shop ke synced accounts, poora replace —
+//                                    top-level shopId lazmi hai; doosri shop ko haath nahi lagta)
 //   GET  /api/device/status          (dashboard ke liye live phone state)
 // Teenon par x-amg-sync header mein AMG_SYNC_TOKEN lagta hai.
 //   - Sync sirf dashboard-side fields badalta hai (qistein, lockState,
@@ -36,6 +37,14 @@
 //   - Synced account ka offline unlock code sirf dashboard deta hai;
 //     server synced accounts ke liye apna code KABHI nahi banata
 //     (server code sirf /api/test/seed wale test accounts ke liye hai).
+//   - sync-all hamesha AIK shop tak mehdood hai (top-level shopId se).
+//     Khaali accounts list us shop ke replica accounts mita deti hai
+//     (deleteShop ki safai ke liye). Doosri shops aur test accounts ko
+//     haath nahi lagta.
+//   - autoLock (dashboard ki lock-policy setting) sync hota hai: off ho
+//     to check-in grace ke baad bhi AUTO-lock nahi lagata (warning phir
+//     bhi lagti hai, dashboard policy jaisa); manual lock hamesha kaam
+//     karta hai.
 //   - data.json mit jaye (Render free restart) to haath se theek NAHI
 //     karna — dashboard se sync-all dobara chalayein, replica khud
 //     dobara ban jata hai. (Phone ko dobara register karna par sakta
@@ -82,6 +91,7 @@ function load() {
   for (const a of data.accounts) {
     if (a.dashboardAccountId === undefined) a.dashboardAccountId = null;
     if (a.offlineCodeUsed === undefined) a.offlineCodeUsed = 0;
+    if (a.autoLock === undefined) a.autoLock = true;
   }
   if (!data.nextAccountId) data.nextAccountId = 1;
   if (!data.nextInstallmentId) data.nextInstallmentId = 1;
@@ -185,7 +195,8 @@ function isValidDateStr(s) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 // Sync body ko jaanch kar saaf shakal mein lautaein; kharab ho to null.
-// Lazmi: dashboardAccountId (number > 0), installments (array).
+// Lazmi: dashboardAccountId (number > 0), shopId (number > 0),
+// installments (array).
 // Baqi fields na hon to update mein purani qeemat rehti hai, naye
 // account mein default lagta hai. Na diya gaya field kabhi ghalat
 // nahi hota — sirf diya gaya ghalat field reject hota hai.
@@ -193,6 +204,10 @@ function validateSyncAccount(b) {
   if (!b || typeof b !== "object" || Array.isArray(b)) return null;
   const dashboardAccountId = Number(b.dashboardAccountId);
   if (!Number.isInteger(dashboardAccountId) || dashboardAccountId <= 0) return null;
+  // shopId LAZMI hai — is ke baghair sync-all doosri shop ke accounts
+  // se farq nahi kar sakta (OQ-1). Dashboard hamesha bhejta hai.
+  const shopId = Number(b.shopId);
+  if (!Number.isInteger(shopId) || shopId <= 0) return null;
   if (!Array.isArray(b.installments)) return null;
   const installments = [];
   const seenSeq = new Set();
@@ -225,9 +240,14 @@ function validateSyncAccount(b) {
     if (typeof b.unlockCode !== "string") return null;
     unlockCode = b.unlockCode.trim().toUpperCase();
   }
+  let autoLock;
+  if (b.autoLock !== undefined) {
+    if (typeof b.autoLock !== "boolean") return null;
+    autoLock = b.autoLock;
+  }
   return {
     dashboardAccountId,
-    shopId: b.shopId === undefined ? undefined : b.shopId,
+    shopId,
     shopName: b.shopName === undefined ? undefined : String(b.shopName),
     shopPhone: b.shopPhone === undefined ? undefined : String(b.shopPhone),
     customerName: b.customerName === undefined ? undefined : String(b.customerName),
@@ -235,6 +255,7 @@ function validateSyncAccount(b) {
     status: b.status,
     lockState: b.lockState,
     unlockCode,
+    autoLock,
     installments,
   };
 }
@@ -254,7 +275,7 @@ function upsertSyncedAccount(norm) {
     acct = {
       id: db.nextAccountId++,
       dashboardAccountId: norm.dashboardAccountId,
-      shopId: norm.shopId !== undefined ? norm.shopId : null,
+      shopId: norm.shopId,
       shopName: norm.shopName !== undefined ? norm.shopName : "",
       shopPhone: norm.shopPhone !== undefined ? norm.shopPhone : "",
       customerName: norm.customerName !== undefined ? norm.customerName : "",
@@ -262,6 +283,7 @@ function upsertSyncedAccount(norm) {
       graceDays: norm.graceDays !== undefined ? norm.graceDays : 5,
       status: norm.status !== undefined ? norm.status : "active",
       lockState: norm.lockState !== undefined ? norm.lockState : "unlocked",
+      autoLock: norm.autoLock !== undefined ? norm.autoLock : true,
       unlockCode: norm.unlockCode !== undefined ? norm.unlockCode : "",
       offlineUnlockUntil: "",
       deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
@@ -269,7 +291,7 @@ function upsertSyncedAccount(norm) {
     };
     db.accounts.push(acct);
   } else {
-    if (norm.shopId !== undefined) acct.shopId = norm.shopId;
+    acct.shopId = norm.shopId;
     if (norm.shopName !== undefined) acct.shopName = norm.shopName;
     if (norm.shopPhone !== undefined) acct.shopPhone = norm.shopPhone;
     if (norm.customerName !== undefined) acct.customerName = norm.customerName;
@@ -277,6 +299,7 @@ function upsertSyncedAccount(norm) {
     if (norm.graceDays !== undefined) acct.graceDays = norm.graceDays;
     if (norm.status !== undefined) acct.status = norm.status;
     if (norm.lockState !== undefined) acct.lockState = norm.lockState;
+    if (norm.autoLock !== undefined) acct.autoLock = norm.autoLock;
     if (norm.unlockCode !== undefined) acct.unlockCode = norm.unlockCode;
     // Phone-side fields yahan jaan boojh kar CHHUE NAHI jate (upar dekhein).
   }
@@ -356,7 +379,9 @@ const server = createServer(async (req, res) => {
         instruction = "lock_now";
         if (!isSynced && !acct.unlockCode) acct.unlockCode = genCode(6);
         offlineUnlockCode = acct.unlockCode || null;
-      } else if (next && today > addDays(next.dueDate, acct.graceDays)) {
+      } else if (next && today > addDays(next.dueDate, acct.graceDays) && acct.autoLock !== false) {
+        // autoLock off ho (dashboard ki lock-policy setting) to grace ke
+        // baad bhi AUTO-lock nahi — neeche warning branch chalegi.
         acct.lockState = "locked";
         if (!isSynced) acct.unlockCode = genCode(6);
         offlineUnlockCode = acct.unlockCode || null;
@@ -433,24 +458,40 @@ const server = createServer(async (req, res) => {
       if (!b || typeof b !== "object" || !Array.isArray(b.accounts)) {
         return send(res, 400, { ok: false, error: "invalid_sync_payload" });
       }
+      // OQ-1 fix: sync-all hamesha AIK shop tak mehdood hai. Top-level
+      // shopId lazmi hai — is ke baghair aik shop ki sync-all doosri
+      // shop ke replica accounts mita deti. Khaali accounts list us
+      // shop ke replica accounts ki safai hai (deleteShop ke liye).
+      const shopId = Number(b.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        return send(res, 400, { ok: false, error: "invalid_sync_payload" });
+      }
       // Pehle SAB ko jaanch lein — aik bhi kharab ho to kuch nahi badlega
       // (atomic: aadha sync kabhi nahi hota).
       const normed = [];
       const seenIds = new Set();
       for (const item of b.accounts) {
-        const norm = validateSyncAccount(item);
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return send(res, 400, { ok: false, error: "invalid_sync_payload" });
+        }
+        // Entry ka shopId top-level se mukhtalif ho to reject — ghalat
+        // shop ka data ghalat replace mein na jaye.
+        if (item.shopId !== undefined && Number(item.shopId) !== shopId) {
+          return send(res, 400, { ok: false, error: "invalid_sync_payload" });
+        }
+        const norm = validateSyncAccount({ ...item, shopId });
         if (!norm || seenIds.has(norm.dashboardAccountId)) {
           return send(res, 400, { ok: false, error: "invalid_sync_payload" });
         }
         seenIds.add(norm.dashboardAccountId);
         normed.push(norm);
       }
-      // Full replace — SIRF synced accounts ka. Test-seed accounts
-      // (dashboardAccountId null) ko haath nahi lagta.
+      // Full replace — SIRF IS SHOP ke synced accounts ka. Doosri shops
+      // ke synced accounts aur test-seed accounts ko haath nahi lagta.
       const removedIds = db.accounts
-        .filter((a) => a.dashboardAccountId != null && !seenIds.has(a.dashboardAccountId))
+        .filter((a) => a.dashboardAccountId != null && a.shopId === shopId && !seenIds.has(a.dashboardAccountId))
         .map((a) => a.id);
-      db.accounts = db.accounts.filter((a) => !(a.dashboardAccountId != null && !seenIds.has(a.dashboardAccountId)));
+      db.accounts = db.accounts.filter((a) => !(a.dashboardAccountId != null && a.shopId === shopId && !seenIds.has(a.dashboardAccountId)));
       db.installments = db.installments.filter((i) => !removedIds.includes(i.accountId));
       for (const norm of normed) {
         // upsert update path mein phone-side fields khud bacha leta hai.
@@ -499,6 +540,7 @@ const server = createServer(async (req, res) => {
         shopName: String(b.shopName || "Al Arab Electronic"),
         shopPhone: String(b.shopPhone || ""), customerName: String(b.customerName || "Test Customer"),
         pairingCode: genCode(8), graceDays, status: "active", lockState: "unlocked",
+        autoLock: true,
         unlockCode: "", offlineUnlockUntil: "", offlineCodeUsed: 0,
         deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
       };

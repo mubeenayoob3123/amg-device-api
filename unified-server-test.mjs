@@ -225,13 +225,13 @@ async function main() {
     t("seed account ka dashboardAccountId null hai", seedAcct?.dashboardAccountId === null, seedAcct);
 
     console.log("\n== I. sync-all: atomicity + full replace + preserve ==");
-    r = await req(34562, "POST", "/api/device/sync-all", { accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)]), { pairingCode: "BAD", installments: [] }] }, syncH);
+    r = await req(34562, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)]), { pairingCode: "BAD", installments: [] }] }, syncH);
     t("sync-all aik kharab entry -> 400 (atomic)", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
     r = await req(34562, "GET", "/api/device/status?dashboardAccountId=101", undefined, syncH);
     t("failed sync-all ke baad purana data waisa hi", r.json?.ok === true && r.json?.deviceRegistered === true, r.json);
-    r = await req(34562, "POST", "/api/device/sync-all", { accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)]), syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)])] }, syncH);
+    r = await req(34562, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)]), syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000)])] }, syncH);
     t("sync-all duplicate dashboardAccountId -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
-    r = await req(34562, "POST", "/api/device/sync-all", { accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
+    r = await req(34562, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
     t("sync-all ok -> synced: 2", r.json?.ok === true && r.json?.synced === 2, r.json);
     r = await req(34562, "GET", "/api/device/status?dashboardAccountId=101", undefined, syncH);
     t("sync-all ke baad purana synced account gaya", r.json?.ok === false && r.json?.error === "account_not_found", r.json);
@@ -242,7 +242,7 @@ async function main() {
     r = await register(34562, "UNIF201A");
     const dev201 = r.json.deviceId;
     t("naya synced account register hota hai", r.json?.ok === true, r.json);
-    r = await req(34562, "POST", "/api/device/sync-all", { accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000, 1000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
+    r = await req(34562, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000, 1000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
     t("dobara sync-all ok", r.json?.ok === true && r.json?.synced === 2, r.json);
     r = await checkin(34562, dev201, "UNIF201A");
     t("sync-all ke baad deviceId bacha rehta hai", r.json?.ok === true && r.json?.instruction === "stay_unlocked", r.json);
@@ -255,7 +255,7 @@ async function main() {
     server = await startServer({ port: 34563, dataFile: dataB, seedToken: SEED, syncToken: SYNC });
     r = await req(34563, "GET", "/health");
     t("wipe ke baad accounts=0", r.json?.accounts === 0 && r.json?.syncedAccounts === 0, r.json);
-    r = await req(34563, "POST", "/api/device/sync-all", { accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000, 1000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
+    r = await req(34563, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000, 1000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
     t("wipe ke baad sync-all restore karta hai", r.json?.ok === true && r.json?.synced === 2, r.json);
     r = await checkin(34563, dev201, "UNIF201A");
     t("wipe ke baad PURANA deviceId nahi chalta (registration data.json mein thi)", r.json?.ok === false && r.json?.error === "device_not_registered", r.json);
@@ -265,6 +265,45 @@ async function main() {
     t("re-register ke baad checkin stay_unlocked (paidAmount bhi restore hua)", r.json?.ok === true && r.json?.instruction === "stay_unlocked" && r.json?.remainingAmount === 9000, r.json);
     r = await req(34563, "GET", "/health");
     t("wipe ke baad seed account wapas nahi aata (sirf synced restore hote hain)", r.json?.accounts === 2 && r.json?.syncedAccounts === 2, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server D: sync-all shop scoping (OQ-1 fix) + autoLock (OQ-2 fix) ----
+    console.log("\n== K. sync-all shop scoping + autoLock ==");
+    const dataD = join(dir, "d.json");
+    server = await startServer({ port: 34564, dataFile: dataD, seedToken: SEED, syncToken: SYNC });
+    r = await req(34564, "POST", "/api/device/sync", { dashboardAccountId: 301, pairingCode: "SCOP301A", installments: [] }, syncH);
+    t("sync bina shopId -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    r = await req(34564, "POST", "/api/device/sync-all", { accounts: [syncBody(301, "SCOP301A", [inst(1, pktDate(30), 5000)])] }, syncH);
+    t("sync-all bina top-level shopId -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    r = await req(34564, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(301, "SCOP301A", [inst(1, pktDate(30), 5000)], { shopId: 2 })] }, syncH);
+    t("sync-all entry shopId mismatch -> 400", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    await req(34564, "POST", "/api/device/sync", syncBody(301, "SCOP301A", [inst(1, pktDate(30), 5000)]), syncH);
+    await req(34564, "POST", "/api/device/sync", syncBody(302, "SCOP302B", [inst(1, pktDate(30), 5000)]), syncH);
+    await req(34564, "POST", "/api/device/sync", syncBody(303, "SCOP303C", [inst(1, pktDate(30), 5000)], { shopId: 2 }), syncH);
+    r = await req(34564, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(301, "SCOP301A", [inst(1, pktDate(30), 5000)])] }, syncH);
+    t("sync-all shop 1 ok -> synced: 1", r.json?.ok === true && r.json?.synced === 1, r.json);
+    r = await req(34564, "GET", "/api/device/status?dashboardAccountId=302", undefined, syncH);
+    t("sync-all ne usi shop ka chhota account mitaya", r.json?.ok === false && r.json?.error === "account_not_found", r.json);
+    r = await req(34564, "GET", "/api/device/status?dashboardAccountId=303", undefined, syncH);
+    t("sync-all doosri shop ko haath nahi lagata", r.json?.ok === true && r.json?.dashboardAccountId === 303, r.json);
+    r = await req(34564, "POST", "/api/device/sync-all", { shopId: 1, accounts: [] }, syncH);
+    t("sync-all khaali list = us shop ki safai", r.json?.ok === true && r.json?.synced === 0, r.json);
+    r = await req(34564, "GET", "/api/device/status?dashboardAccountId=301", undefined, syncH);
+    t("safai ke baad shop 1 ka account gaya", r.json?.ok === false && r.json?.error === "account_not_found", r.json);
+    r = await req(34564, "GET", "/api/device/status?dashboardAccountId=303", undefined, syncH);
+    t("safai ke baad bhi shop 2 ka account bacha", r.json?.ok === true && r.json?.dashboardAccountId === 303, r.json);
+    await req(34564, "POST", "/api/device/sync", syncBody(304, "SCOP304D", [inst(1, pktDate(-10), 10000)], { autoLock: false }), syncH);
+    r = await register(34564, "SCOP304D");
+    const dev304 = r.json?.deviceId;
+    r = await checkin(34564, dev304, "SCOP304D");
+    t("autoLock off + grace guzri -> warn, lock nahi", r.json?.ok === true && r.json?.instruction === "warn", r.json);
+    await req(34564, "POST", "/api/device/sync", syncBody(304, "SCOP304D", [inst(1, pktDate(-10), 10000)], { autoLock: true }), syncH);
+    r = await checkin(34564, dev304, "SCOP304D");
+    t("autoLock on + grace guzri -> lock_now", r.json?.ok === true && r.json?.instruction === "lock_now", r.json);
+    await req(34564, "POST", "/api/device/sync", syncBody(305, "SCOP305E", [inst(1, pktDate(30), 10000)], { autoLock: false, lockState: "locked", unlockCode: "MANU01" }), syncH);
+    r = await register(34564, "SCOP305E");
+    r = await checkin(34564, r.json?.deviceId, "SCOP305E");
+    t("manual lock autoLock off mein bhi lock_now", r.json?.ok === true && r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "MANU01", r.json);
     await stopServer(server); server = null;
   } finally {
     await stopServer(server);
