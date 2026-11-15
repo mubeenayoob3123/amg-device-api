@@ -1,17 +1,22 @@
-// AMG unified device API v2.1 + FCM (Wave 5.4) — local test battery (plain node, no deps)
+// AMG unified device API v2.1 + FCM HTTP v1 (unified-4, Audit Round 2 fixes)
+// — local test battery (plain node, no deps)
 // Chalana:  node unified-server-test.mjs
 // Ye test server ko scratch port + temp data file ke saath chalata hai,
 // live Render server ko haath nahi lagata. Exit code 0 = sab pass.
 // Section Q fcm.mjs ko seedha import karke jaanchta hai (stubbed fetch);
-// section R mein FCM_ENDPOINT aik local stub server ki taraf modha jata
-// hai taake asli push dekha ja sake (koi asli Firebase call nahi hoti).
+// section R mein FCM_ENDPOINT + FCM_TOKEN_ENDPOINT aik local stub server
+// ki taraf modhe jate hain taake asli push dekha ja sake (koi asli
+// Firebase call nahi hoti). Sections S–Z Audit Round 2 ke naye fixes
+// hain (J1-C03, J1-M23, J1-M24, J2-M10–M13, J2-m19–m28, J2-p11–p13,
+// J1-p11, J1-m53, J1-p16 + contract additions).
 import { spawn } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
-import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sendFcmPush, FCM_DEFAULT_ENDPOINT } from "./fcm.mjs";
+import { generateKeyPairSync, createVerify } from "node:crypto";
+import { sendFcmPush, parseServiceAccount, buildServiceAccountJwt, clearFcmTokenCache, fcmV1Endpoint, FCM_DEFAULT_TOKEN_URL } from "./fcm.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(__dirname, "server.mjs");
@@ -105,7 +110,7 @@ async function main() {
     r = await req(34561, "GET", "/api/device/status?dashboardAccountId=1", undefined, syncH);
     t("status bina token env -> 403 sync_disabled", r.status === 403 && r.json?.error === "sync_disabled", r.json);
     r = await req(34561, "GET", "/health");
-    t("health version unified-3 + counts + fcmConfigured=false", r.json?.version === "unified-3" && r.json?.accounts === 0 && r.json?.syncedAccounts === 0 && r.json?.fcmConfigured === false, r.json);
+    t("health version unified-4, NO account counts (J2-p12), fcmConfigured=false", r.json?.version === "unified-4" && r.json?.ok === true && r.json?.service === "amg-device-api" && !("accounts" in (r.json || {})) && !("syncedAccounts" in (r.json || {})) && r.json?.fcmConfigured === false, r.json);
     await stopServer(server); server = null;
 
     // ---- Server B: dono tokens set ----
@@ -127,8 +132,8 @@ async function main() {
     console.log("\n== C. Sync upsert + phone fields preserve ==");
     r = await req(34562, "POST", "/api/device/sync", syncBody(101, "UNIF101A", [inst(1, pktDate(30), 10000), inst(2, addMonthsStr(pktDate(30), 1), 10000)]), syncH);
     t("sync D=101 ok + accountId milta hai", r.status === 200 && r.json?.ok === true && typeof r.json?.accountId === "number" && r.json?.dashboardAccountId === 101, r.json);
-    r = await req(34562, "GET", "/health");
-    t("health syncedAccounts=1", r.json?.syncedAccounts === 1 && r.json?.accounts === 1, r.json);
+    r = await req(34562, "GET", "/api/test/accounts", undefined, seedH);
+    t("dump mein synced account 1 hai (health counts hata diye gaye)", Array.isArray(r.json?.accounts) && r.json.accounts.length === 1 && r.json.accounts[0].dashboardAccountId === 101, r.json);
     r = await register(34562, "UNIF101A");
     t("synced account par register ok", r.json?.ok === true && typeof r.json?.deviceId === "string" && r.json.deviceId.startsWith("dev_"), r.json);
     const dev101 = r.json.deviceId;
@@ -143,7 +148,9 @@ async function main() {
     t("status: deviceRegistered + deviceName + lastSeenAt", r.json?.ok === true && r.json?.deviceRegistered === true && r.json?.deviceName === "Pixel Test" && typeof r.json?.lastSeenAt === "string" && r.json.lastSeenAt.length > 0, r.json);
     r = await req(34562, "GET", "/api/test/accounts", undefined, seedH);
     const acct101 = r.json?.accounts?.find((a) => a.dashboardAccountId === 101);
-    t("imei + deviceId sync se nahi mitay", acct101?.imei === "123456789012345" && acct101?.deviceId === dev101 && acct101?.customerName === "Test 101 Updated", acct101);
+    // J2-m19: dump mein deviceId/imei MASK hote hain ("***") — asli
+    // qeemat check-in se verify hoti hai (upar: purana deviceId chalta hai).
+    t("dump mein deviceId/imei masked + customerName update hua", acct101?.deviceId === "***" && acct101?.imei === "***" && acct101?.customerName === "Test 101 Updated", acct101);
 
     console.log("\n== D. S-C1 + S-M1 regressions ==");
     r = await checkin(34562, "", "UNIF101A");
@@ -153,7 +160,8 @@ async function main() {
     await req(34562, "POST", "/api/device/sync", syncBody(106, "UNIF106F", [inst(1, pktDate(0), 10000)]), syncH);
     r = await register(34562, "UNIF106F");
     r = await checkin(34562, r.json.deviceId, "UNIF106F");
-    t("S-M1: due aaj (PKT) -> warn", r.json?.instruction === "warn", r.json);
+    // J1-m53: due date khud reminder ka din hai — warning agle din se.
+    t("S-M1/J1-m53: due aaj (PKT) -> stay_unlocked + graceDaysLeft=5 (warn nahi)", r.json?.instruction === "stay_unlocked" && r.json?.graceDaysLeft === 5, r.json);
     await req(34562, "POST", "/api/device/sync", syncBody(107, "UNIF107G", [inst(1, pktDate(1), 10000)]), syncH);
     r = await register(34562, "UNIF107G");
     r = await checkin(34562, r.json.deviceId, "UNIF107G");
@@ -224,9 +232,9 @@ async function main() {
     t("test/pay ab bhi chalta hai -> completed", r.json?.ok === true && r.json?.status === "completed", r.json);
     r = await checkin(34562, devSeed, seedCode);
     t("seed final payment -> permanent_unlock", r.json?.instruction === "permanent_unlock", r.json);
-    r = await req(34562, "GET", "/health");
-    t("health: seed syncedAccounts mein nahi gina jata", r.json?.accounts === r.json?.syncedAccounts + 1, r.json);
     r = await req(34562, "GET", "/api/test/accounts", undefined, seedH);
+    const syncedCount = (r.json?.accounts || []).filter((a) => a.dashboardAccountId != null).length;
+    t("dump: seed synced mein nahi gina jata (kul = synced + 1)", (r.json?.accounts || []).length === syncedCount + 1, r.json);
     const seedAcct = r.json?.accounts?.find((a) => a.id === seedAcctId);
     t("seed account ka dashboardAccountId null hai", seedAcct?.dashboardAccountId === null, seedAcct);
 
@@ -257,10 +265,13 @@ async function main() {
 
     // ---- Server C: wipe recovery (data file delete + restart) ----
     console.log("\n== J. Wipe recovery ==");
+    // Render wipe poori disk mitata hai — .bak bhi (J2-M10: .bak
+    // sirf kharab-file recovery ke liye hai, wipe ke baad nahi rehta).
     unlinkSync(dataB);
+    if (existsSync(dataB + ".bak")) unlinkSync(dataB + ".bak");
     server = await startServer({ port: 34563, dataFile: dataB, seedToken: SEED, syncToken: SYNC });
-    r = await req(34563, "GET", "/health");
-    t("wipe ke baad accounts=0", r.json?.accounts === 0 && r.json?.syncedAccounts === 0, r.json);
+    r = await req(34563, "GET", "/api/test/accounts", undefined, seedH);
+    t("wipe ke baad accounts=0", Array.isArray(r.json?.accounts) && r.json.accounts.length === 0, r.json);
     r = await req(34563, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(201, "UNIF201A", [inst(1, pktDate(30), 5000, 1000), inst(2, addMonthsStr(pktDate(30), 1), 5000)]), syncBody(202, "UNIF202B", [inst(1, pktDate(30), 7000)])] }, syncH);
     t("wipe ke baad sync-all restore karta hai", r.json?.ok === true && r.json?.synced === 2, r.json);
     r = await checkin(34563, dev201, "UNIF201A");
@@ -269,8 +280,8 @@ async function main() {
     t("wipe ke baad dobara register hota hai", r.json?.ok === true && typeof r.json?.deviceId === "string", r.json);
     r = await checkin(34563, r.json.deviceId, "UNIF201A");
     t("re-register ke baad checkin stay_unlocked (paidAmount bhi restore hua)", r.json?.ok === true && r.json?.instruction === "stay_unlocked" && r.json?.remainingAmount === 9000, r.json);
-    r = await req(34563, "GET", "/health");
-    t("wipe ke baad seed account wapas nahi aata (sirf synced restore hote hain)", r.json?.accounts === 2 && r.json?.syncedAccounts === 2, r.json);
+    r = await req(34563, "GET", "/api/test/accounts", undefined, seedH);
+    t("wipe ke baad seed account wapas nahi aata (sirf synced restore hote hain)", (r.json?.accounts || []).length === 2 && (r.json.accounts || []).every((a) => a.dashboardAccountId != null), r.json);
     await stopServer(server); server = null;
 
     // ---- Server D: sync-all shop scoping (OQ-1 fix) + autoLock (OQ-2 fix) ----
@@ -358,7 +369,10 @@ async function main() {
     t("L2: PU-M1 fresh code resets latch + clears window", r.json?.offlineCodeUsed === false && r.json?.offlineUnlockUntil === "", r.json);
     await req(34565, "POST", "/api/device/sync", syncBody(402, "M1402AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M1CCCC", offlineUnlockUntil: win12h, offlineCodeUsed: true }), syncH);
     r = await req(34565, "GET", "/api/device/status?dashboardAccountId=402", undefined, syncH);
-    t("L2: fresh code wins over explicit latch restore", r.json?.offlineCodeUsed === false && r.json?.offlineUnlockUntil === "", r.json);
+    // J1-C03: saaf restore bheji gayi ho to restore JEET-TI hai —
+    // naya code bhi window/latch nahi mita sakta (pehle fresh code
+    // jeet-ta tha; yehi wo rule tha jo kamaya hua window kha jata tha).
+    t("L2/J1-C03: explicit restore wins over fresh code", r.json?.offlineCodeUsed === true && r.json?.offlineUnlockUntil === win12h, r.json);
     // Full cycle: use code -> dashboard syncs "" -> latch stays; fresh code -> reset.
     await req(34565, "POST", "/api/device/sync", syncBody(403, "M1403AAA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "M1DDDD" }), syncH);
     r = await register(34565, "M1403AAA");
@@ -412,9 +426,10 @@ async function main() {
     t("M: pre-wipe window earned", r.json?.ok === true && typeof earnedWindow === "string" && earnedWindow.length > 0, r.json);
     await stopServer(server); server = null;
     unlinkSync(dataF);
+    if (existsSync(dataF + ".bak")) unlinkSync(dataF + ".bak");
     server = await startServer({ port: 34566, dataFile: dataF, seedToken: SEED, syncToken: SYNC });
-    r = await req(34566, "GET", "/health");
-    t("M: wipe ke baad accounts=0", r.json?.accounts === 0, r.json);
+    r = await req(34566, "GET", "/api/test/accounts", undefined, seedH);
+    t("M: wipe ke baad accounts=0", Array.isArray(r.json?.accounts) && r.json.accounts.length === 0, r.json);
     // Dashboard re-asserts the adopted window + latch via sync-all.
     r = await req(34566, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(411, "M5411AAA", [inst(1, pktDate(-10), 10000)], { unlockCode: "M5WIP01", offlineUnlockUntil: earnedWindow, offlineCodeUsed: true })] }, syncH);
     t("M: sync-all with adopted window ok", r.json?.ok === true && r.json?.synced === 1, r.json);
@@ -526,69 +541,65 @@ async function main() {
     t("O: N4 Mar 31 +1 = Apr 30", JSON.stringify(mar31) === JSON.stringify(["2026-03-31", "2026-04-30"]), mar31);
     await stopServer(server); server = null;
 
-    // ---- Server I: PU-S10 rate limiting + salted hash ----
-    console.log("\n== P. PU-S10 rate limiting + salted hash ==");
+    // ---- Server I: PU-S10 rate limiting + salted hash (J1-M24 re-keyed) ----
+    console.log("\n== P. PU-S10 rate limiting (code/device keyed) + salted hash ==");
     const dataI = join(dir, "i.json");
     server = await startServer({ port: 34569, dataFile: dataI, seedToken: SEED, syncToken: SYNC });
-    // Register: 10 ghalat koshishen ek IP se -> 11th 429.
-    const badIp = { "x-forwarded-for": "203.0.113.1" };
+    // Register: 10 ghalat koshishen AIK CODE se -> 11th 429. XFF har
+    // dafa mukhtalif hai — rotation se limit bypass NAHI hoti (J1-M24).
     let lastErr = "";
     for (let i = 0; i < 10; i++) {
-      r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
+      r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": `203.0.113.${i + 1}` });
       lastErr = r.json?.error;
     }
-    t("P: 10 ghalat register -> invalid_pairing_code (rok nahi)", lastErr === "invalid_pairing_code", lastErr);
-    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
-    t("P: PU-S10 11th koshish -> 429 too_many_attempts", r.status === 429 && r.json?.error === "too_many_attempts" && typeof r.json?.message === "string", r.json);
-    // Doosri IP rok mein nahi hai.
-    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": "203.0.113.2" });
-    t("P: doosri IP par rok nahi (per-IP)", r.status === 200 && r.json?.error === "invalid_pairing_code", r.json);
-    // Sahi code bhi blocked IP se nahi chalta.
+    t("P: 10 ghalat register (rotating XFF) -> invalid_pairing_code (rok nahi)", lastErr === "invalid_pairing_code", lastErr);
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": "198.51.100.99" });
+    t("P: PU-S10/J1-M24 11th koshish -> 429 (XFF badalne se bhi rok)", r.status === 429 && r.json?.error === "too_many_attempts" && typeof r.json?.message === "string", r.json);
+    // Doosra code rok mein nahi hai (per-code, per-IP nahi).
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "DOOSRA11", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": "203.0.113.1" });
+    t("P: doosre code par rok nahi (per-code)", r.status === 200 && r.json?.error === "invalid_pairing_code", r.json);
+    // Sahi code usi "IP" se chalta hai — shop ki Wi-Fi block nahi hoti.
     await req(34569, "POST", "/api/device/sync", syncBody(701, "RL701AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL701A" }), syncH);
-    r = await req(34569, "POST", "/api/device/register", { pairingCode: "RL701AAA", imei: "1", model: "X", androidVersion: "14" }, badIp);
-    t("P: blocked IP se sahi code bhi 429", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
-    r = await register(34569, "RL701AAA");
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "RL701AAA", imei: "1", model: "X", androidVersion: "14" }, { "x-forwarded-for": "203.0.113.1" });
+    t("P: J1-M24 sahi code usi IP se chalta hai (koi shared-WiFi block nahi)", r.json?.ok === true, r.json);
     const dev701 = r.json.deviceId;
-    t("P: doosri IP (default) se register ok", r.json?.ok === true, r.json);
     // Restart ke baad bhi rok qaim (data.json mein mehfooz).
     await stopServer(server);
     server = await startServer({ port: 34569, dataFile: dataI, seedToken: SEED, syncToken: SYNC });
-    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, badIp);
+    r = await req(34569, "POST", "/api/device/register", { pairingCode: "NOKHUCH1", imei: "", model: "X", androidVersion: "14" }, { "x-forwarded-for": "203.0.113.1" });
     t("P: restart ke baad bhi 429 (rate limit data.json mein)", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
-    // offline-code-used: 10 ghalat code ek device se -> 11th 429.
-    const ocuIp = { "x-forwarded-for": "203.0.113.10" };
+    // offline-code-used: 10 ghalat code ek device se -> 11th 429 (XFF rotate bhi).
     r = await checkin(34569, dev701, "RL701AAA");
     t("P: locked account checkin -> lock_now + code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "RL701A", r.json);
     for (let i = 0; i < 10; i++) {
-      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "WRONG1" }, ocuIp);
+      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "WRONG1" }, { "x-forwarded-for": `203.0.113.${20 + i}` });
       lastErr = r.json?.error;
     }
     t("P: 10 ghalat code -> invalid_unlock_code", lastErr === "invalid_unlock_code", lastErr);
-    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "RL701A" }, ocuIp);
-    t("P: PU-S10 11th code koshish -> 429 (sahi code bhi blocked)", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
-    // Doosra device (doosri IP) rok mein nahi hai.
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev701, code: "RL701A" }, { "x-forwarded-for": "198.51.100.99" });
+    t("P: PU-S10 11th code koshish -> 429 (sahi code bhi blocked, XFF se farq nahi)", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
+    // Doosra device rok mein nahi hai (per-device).
     await req(34569, "POST", "/api/device/sync", syncBody(702, "RL702AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL702A" }), syncH);
     r = await register(34569, "RL702AAA");
     const dev702 = r.json.deviceId;
-    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev702, code: "WRONG1" }, { "x-forwarded-for": "203.0.113.11" });
-    t("P: doosra device rok mein nahi (per-device)", r.status === 200 && r.json?.error === "invalid_unlock_code", r.json);
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev702, code: "WRONG1" }, { "x-forwarded-for": "203.0.113.20" });
+    t("P: doosra device rok mein nahi (per-device, usi IP se bhi)", r.status === 200 && r.json?.error === "invalid_unlock_code", r.json);
     // Kamyab code counter saaf kar deta hai: 9 ghalat -> sahi -> 9 ghalat (rok nahi).
     await req(34569, "POST", "/api/device/sync", syncBody(703, "RL703AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL703A" }), syncH);
     r = await register(34569, "RL703AAA");
     const dev703 = r.json.deviceId;
-    const clrIp = { "x-forwarded-for": "203.0.113.12" };
-    for (let i = 0; i < 9; i++) await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" }, clrIp);
-    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "RL703A" }, clrIp);
+    for (let i = 0; i < 9; i++) await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" });
+    r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "RL703A" });
     t("P: 9 ghalat ke baad sahi code chalta hai", r.json?.ok === true, r.json);
     // Dobara lock karein (naya code) taake 9 ghalat dobara try ho sakein.
     await req(34569, "POST", "/api/device/sync", syncBody(703, "RL703AAA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RL703B" }), syncH);
     let blocked = false;
     for (let i = 0; i < 9; i++) {
-      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" }, clrIp);
+      r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: dev703, code: "WRONG1" });
       if (r.status === 429) blocked = true;
     }
     t("P: kamyabi ke baad counter saaf — 9 ghalat dobara rok nahi", blocked === false, blocked);
-    // Salted hash: seed account ka code sirf pehli lock_now mein milta hai.
+    // Salted hash: seed account ka code har lock_now mein milta hai (J1-p16).
     r = await req(34569, "POST", "/api/test/seed", { total: 10000, months: 1, graceDays: 5, firstDueDate: pktDate(-10) }, seedH);
     const seedCode2 = r.json.pairingCode;
     const seedId2 = r.json.accountId;
@@ -598,52 +609,149 @@ async function main() {
     const firstCode = r.json?.offlineUnlockCode;
     t("P: seed pehli lock_now WITH server code", r.json?.instruction === "lock_now" && typeof firstCode === "string" && /^[A-Z2-9]{6}$/.test(firstCode), r.json);
     r = await checkin(34569, devSeed2, seedCode2);
-    t("P: PU-S10 seed doosri lock_now code ke BAGHAIR (phone ke paas hash hai)", r.json?.instruction === "lock_now" && !("offlineUnlockCode" in (r.json || {})), r.json);
+    t("P: J1-p16 seed doosri lock_now mein BHI wahi code (jawab gum ho to dobara milta hai)", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === firstCode, r.json);
     r = await req(34569, "GET", "/api/test/accounts", undefined, seedH);
     const seedAcct2 = r.json?.accounts?.find((a) => a.id === seedId2);
-    t("P: seed code data mein salted hash hai, plaintext nahi", typeof seedAcct2?.unlockCodeHash === "string" && seedAcct2.unlockCodeHash.includes(":") && seedAcct2.unlockCode === "", seedAcct2);
+    // J2-m19: dump mein hash bhi masked hai — hash ki maujoodgi
+    // offline-code-used se verify hoti hai (agla test).
+    t("P: seed code dump mein masked hai (hash bhi plaintext nahi)", seedAcct2?.unlockCodeHash === "***" && seedAcct2?.unlockCode === "", seedAcct2);
     r = await req(34569, "POST", "/api/device/offline-code-used", { deviceId: devSeed2, code: firstCode });
     t("P: seed code hash se verify ho kar chalta hai", r.json?.ok === true && typeof r.json?.offlineUnlockUntil === "string", r.json);
+    r = await checkin(34569, devSeed2, seedCode2);
+    t("P: J1-p16 istemal ke baad code dobara NAHI bheja jata (latch)", r.json?.instruction === "stay_unlocked" && !("offlineUnlockCode" in (r.json || {})), r.json);
     await stopServer(server); server = null;
 
-    // ---- Section Q: FCM send unit tests (fcm.mjs, stubbed fetch — koi server nahi) ----
-    console.log("\n== Q. FCM send unit tests (stubbed fetch) ==");
-    let stubCalls = [];
-    const stubOk = async (url, opts) => {
-      stubCalls.push({ url, opts, body: JSON.parse(opts.body) });
-      return { ok: true, status: 200, json: async () => ({ message_id: "0:1234%abc" }) };
+    // ---- Section Q: FCM HTTP v1 unit tests (fcm.mjs, stubbed fetch — koi server nahi) ----
+    console.log("\n== Q. FCM HTTP v1 unit tests (stubbed fetch) ==");
+    // Test ke liye aik asli RSA keypair banayein (koi asli Firebase key nahi).
+    const { publicKey: qPub, privateKey: qPriv } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const qPubPem = qPub.export({ type: "spki", format: "pem" });
+    const SA = {
+      project_id: "amg-test-project",
+      client_email: "fcm-test@amg-test-project.iam.gserviceaccount.com",
+      private_key: qPriv.export({ type: "pkcs8", format: "pem" }),
     };
-    let out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", data: { type: "amg_checkin", reason: "unlocked" }, fetchFn: stubOk });
-    t("Q: stub success -> ok + messageId", out.ok === true && out.messageId === "0:1234%abc", out);
-    t("Q: legacy endpoint + key header + high priority + data", stubCalls.length === 1 && stubCalls[0].url === FCM_DEFAULT_ENDPOINT && stubCalls[0].opts.headers.Authorization === "key=key-123" && stubCalls[0].body.to === "tok-1" && stubCalls[0].body.priority === "high" && stubCalls[0].body.data.type === "amg_checkin", stubCalls[0]);
-    const stub401 = async () => ({ ok: false, status: 401, json: async () => ({ error: "InvalidKey" }) });
-    out = await sendFcmPush({ serverKey: "bad-key", token: "tok-1", fetchFn: stub401 });
+    const SA_JSON = JSON.stringify(SA);
+    function verifyJwt(jwt) {
+      const parts = String(jwt || "").split(".");
+      if (parts.length !== 3) return false;
+      const verifier = createVerify("RSA-SHA256");
+      verifier.update(parts[0] + "." + parts[1]);
+      verifier.end();
+      try {
+        return verifier.verify(qPubPem, Buffer.from(parts[2], "base64url"));
+      } catch { return false; }
+    }
+    function jwtPart(jwt, idx) {
+      try {
+        return JSON.parse(Buffer.from(String(jwt).split(".")[idx], "base64url").toString("utf8"));
+      } catch { return null; }
+    }
+    // parseServiceAccount
+    const parsedSa = parseServiceAccount(SA_JSON);
+    t("Q: parseServiceAccount JSON string -> projectId/clientEmail/privateKey", parsedSa?.projectId === "amg-test-project" && parsedSa?.clientEmail === SA.client_email && parsedSa?.privateKey === SA.private_key, parsedSa);
+    t("Q: parseServiceAccount kharab JSON -> null", parseServiceAccount("{kharab") === null && parseServiceAccount("") === null && parseServiceAccount(null) === null);
+    t("Q: parseServiceAccount adhoori fields -> null", parseServiceAccount(JSON.stringify({ project_id: "x" })) === null && parseServiceAccount(JSON.stringify({ ...SA, private_key: "not-a-pem" })) === null);
+    // JWT shakal + signature
+    const testJwt = buildServiceAccountJwt(parsedSa, Date.now());
+    const jwtHeader = jwtPart(testJwt, 0);
+    const jwtClaims = jwtPart(testJwt, 1);
+    t("Q: JWT 3 hisse, header alg RS256", String(testJwt).split(".").length === 3 && jwtHeader?.alg === "RS256" && jwtHeader?.typ === "JWT", jwtHeader);
+    t("Q: JWT claims iss/scope/aud/exp-iat=3600", jwtClaims?.iss === SA.client_email && jwtClaims?.scope === "https://www.googleapis.com/auth/firebase.messaging" && jwtClaims?.aud === FCM_DEFAULT_TOKEN_URL && jwtClaims?.exp - jwtClaims?.iat === 3600, jwtClaims);
+    t("Q: JWT RS256 signature public key se verify hoti hai", verifyJwt(testJwt) === true);
+    // Stub fetch: token endpoint + messages endpoint.
+    let tokenCalls = [];
+    let msgCalls = [];
+    function makeStub({ tokenStatus = 200, tokenBody = null, msgStatus = 200, msgBody = null, throwOnMsg = false } = {}) {
+      return async (url, opts) => {
+        if (String(url).includes("/oauth2/token") || String(url).includes("token")) {
+          tokenCalls.push({ url, opts, body: String(opts?.body || "") });
+          if (tokenStatus !== 200) return { ok: false, status: tokenStatus, json: async () => (tokenBody || { error: "invalid_grant" }) };
+          return { ok: true, status: 200, json: async () => (tokenBody || { access_token: "stub-access-1", expires_in: 3600, token_type: "Bearer" }) };
+        }
+        msgCalls.push({ url, opts, body: opts?.body ? JSON.parse(opts.body) : null });
+        if (throwOnMsg) throw new Error("dns fail");
+        if (msgStatus !== 200) return { ok: false, status: msgStatus, json: async () => (msgBody || { error: { status: "UNAUTHENTICATED", message: "bad" } }) };
+        return { ok: true, status: 200, json: async () => (msgBody || { name: "projects/amg-test-project/messages/msg-1" }) };
+      };
+    }
+    // Success + poori shakal.
+    clearFcmTokenCache();
+    tokenCalls = []; msgCalls = [];
+    let out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", data: { type: "amg_checkin", reason: "unlocked", dashboardAccountId: "801" }, fetchFn: makeStub() });
+    t("Q: stub success -> ok + messageId (v1 name)", out.ok === true && out.messageId === "projects/amg-test-project/messages/msg-1", out);
+    const assertion = new URLSearchParams(tokenCalls[0]?.body || "").get("assertion") || "";
+    t("Q: token endpoint par JWT assertion (grant_type + verifiable RS256)", tokenCalls.length === 1 && tokenCalls[0].url === FCM_DEFAULT_TOKEN_URL && new URLSearchParams(tokenCalls[0].body).get("grant_type") === "urn:ietf:params:oauth:grant-type:jwt-bearer" && verifyJwt(assertion) === true, tokenCalls[0]);
+    t("Q: v1 endpoint + Bearer header + message{token,data,android HIGH}", msgCalls.length === 1 && msgCalls[0].url === fcmV1Endpoint("amg-test-project") && msgCalls[0].opts.headers.Authorization === "Bearer stub-access-1" && msgCalls[0].body?.message?.token === "tok-1" && msgCalls[0].body?.message?.data?.type === "amg_checkin" && msgCalls[0].body?.message?.data?.reason === "unlocked" && msgCalls[0].body?.message?.android?.priority === "HIGH", msgCalls[0]);
+    t("Q: J2-m22 dono FCM calls par AbortSignal timeout hai", tokenCalls[0]?.opts?.signal instanceof AbortSignal && msgCalls[0]?.opts?.signal instanceof AbortSignal);
+    // Token caching: doosri send par naya token NAHI manga jata.
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", data: { type: "amg_checkin", reason: "locked" }, fetchFn: makeStub() });
+    t("Q: token cache — doosri send par token call nahi (1 hi rehta hai)", out.ok === true && tokenCalls.length === 1 && msgCalls.length === 2, { tokenCalls: tokenCalls.length, msgCalls: msgCalls.length });
+    // Chhoti expiry (60s < 5-min buffer) — har dafa naya token.
+    clearFcmTokenCache();
+    tokenCalls = []; msgCalls = [];
+    const shortStub = makeStub({ tokenBody: { access_token: "stub-short", expires_in: 60, token_type: "Bearer" } });
+    await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", fetchFn: shortStub });
+    await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", fetchFn: shortStub });
+    t("Q: expiry qareeb ho to token dobara manga jata hai (refresh)", tokenCalls.length === 2, tokenCalls.length);
+    // Token endpoint fail -> fcm_auth_error, message call nahi hota.
+    clearFcmTokenCache();
+    tokenCalls = []; msgCalls = [];
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", fetchFn: makeStub({ tokenStatus: 400 }) });
+    t("Q: token endpoint 400 -> fcm_auth_error, message nahi bheja jata", out.ok === false && out.error === "fcm_auth_error" && msgCalls.length === 0, out);
+    // 404 UNREGISTERED -> tokenDead.
+    clearFcmTokenCache();
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-dead", fetchFn: makeStub({ msgStatus: 404, msgBody: { error: { code: 404, status: "NOT_FOUND", message: "Requested entity was not found. UNREGISTERED" } } }) });
+    t("Q: 404 UNREGISTERED -> fcm_token_not_found + tokenDead", out.ok === false && out.error === "fcm_token_not_found" && out.tokenDead === true, out);
+    // 401 -> fcm_http_401.
+    clearFcmTokenCache();
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", fetchFn: makeStub({ msgStatus: 401 }) });
     t("Q: FCM 401 -> fcm_http_401", out.ok === false && out.error === "fcm_http_401", out);
-    const stubThrow = async () => { throw new Error("dns fail"); };
-    out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", fetchFn: stubThrow });
-    t("Q: fetch throw -> fcm_network_error (kabhi throw nahi)", out.ok === false && out.error === "fcm_network_error", out);
-    stubCalls = [];
-    out = await sendFcmPush({ serverKey: "", token: "tok-1", fetchFn: stubOk });
-    t("Q: bina server key -> fcm_not_configured, fetch call nahi hota", out.ok === false && out.error === "fcm_not_configured" && stubCalls.length === 0, out);
-    out = await sendFcmPush({ serverKey: "key-123", token: "   ", fetchFn: stubOk });
+    // Send par network throw -> fcm_network_error (kabhi throw nahi).
+    clearFcmTokenCache();
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", fetchFn: makeStub({ throwOnMsg: true }) });
+    t("Q: send fetch throw -> fcm_network_error (kabhi throw nahi)", out.ok === false && out.error === "fcm_network_error", out);
+    // Bina service account -> fcm_not_configured, fetch call nahi hota.
+    tokenCalls = []; msgCalls = [];
+    out = await sendFcmPush({ serviceAccount: "", token: "tok-1", fetchFn: makeStub() });
+    t("Q: bina service account -> fcm_not_configured, fetch call nahi hota", out.ok === false && out.error === "fcm_not_configured" && tokenCalls.length === 0 && msgCalls.length === 0, out);
+    out = await sendFcmPush({ serviceAccount: "{kharab", token: "tok-1", fetchFn: makeStub() });
+    t("Q: kharab service account JSON -> fcm_not_configured", out.ok === false && out.error === "fcm_not_configured", out);
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "   ", fetchFn: makeStub() });
     t("Q: khaali token -> no_token", out.ok === false && out.error === "no_token", out);
-    stubCalls = [];
-    out = await sendFcmPush({ serverKey: "key-123", token: "tok-1", endpoint: "http://127.0.0.1:9/stub", fetchFn: stubOk });
-    t("Q: custom endpoint istemal hota hai", out.ok === true && stubCalls[0].url === "http://127.0.0.1:9/stub", stubCalls[0]);
+    // Custom endpoint + custom token endpoint.
+    clearFcmTokenCache();
+    tokenCalls = []; msgCalls = [];
+    out = await sendFcmPush({ serviceAccount: SA_JSON, token: "tok-1", endpoint: "http://127.0.0.1:9/v1/stub-send", tokenEndpoint: "http://127.0.0.1:9/oauth2/token", fetchFn: makeStub() });
+    t("Q: custom endpoint + custom token endpoint istemal hote hain", out.ok === true && msgCalls[0]?.url === "http://127.0.0.1:9/v1/stub-send" && tokenCalls[0]?.url === "http://127.0.0.1:9/oauth2/token", { msg: msgCalls[0]?.url, tok: tokenCalls[0]?.url });
 
-    // ---- Section R: FCM trigger (sync unlock/completed -> push, local stub endpoint) ----
-    console.log("\n== R. FCM trigger: sync unlock/completed -> push ==");
+    // ---- Section R: FCM trigger (sync unlock/completed/LOCK -> push, local stub endpoint) ----
+    console.log("\n== R. FCM trigger: sync unlock/completed/LOCK -> push (HTTP v1) ==");
     const fcmStubPort = 34580;
     const pushes = [];
+    let stubTokenCalls = 0;
     const fcmStub = createHttpServer((req2, res2) => {
       let body = "";
       req2.on("data", (c) => { body += c; });
       req2.on("end", () => {
+        // Token endpoint: OAuth2 stub.
+        if (req2.url === "/oauth2/token") {
+          stubTokenCalls += 1;
+          res2.writeHead(200, { "Content-Type": "application/json" });
+          res2.end(JSON.stringify({ access_token: "stub-access-token", expires_in: 3600, token_type: "Bearer" }));
+          return;
+        }
         let parsed = null;
         try { parsed = JSON.parse(body); } catch { /* ignore */ }
         pushes.push({ path: req2.url, auth: req2.headers.authorization || "", body: parsed });
+        // Dead-token stub: is token par Firebase 404 UNREGISTERED deta hai.
+        if (parsed?.message?.token === "fcm-token-dead") {
+          res2.writeHead(404, { "Content-Type": "application/json" });
+          res2.end(JSON.stringify({ error: { code: 404, status: "NOT_FOUND", message: "Requested entity was not found. UNREGISTERED" } }));
+          return;
+        }
         res2.writeHead(200, { "Content-Type": "application/json" });
-        res2.end(JSON.stringify({ message_id: "0:stub%1" }));
+        res2.end(JSON.stringify({ name: "projects/amg-test-project/messages/stub-1" }));
       });
     });
     await new Promise((resolve) => fcmStub.listen(fcmStubPort, "127.0.0.1", resolve));
@@ -657,10 +765,14 @@ async function main() {
     }
     try {
       const dataR = join(dir, "r.json");
-      const fcmEnv = { FCM_SERVER_KEY: "test-fcm-key", FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/fcm/send` };
+      const fcmEnv = {
+        FCM_SERVICE_ACCOUNT_JSON: SA_JSON,
+        FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/v1/projects/amg-test-project/messages:send`,
+        FCM_TOKEN_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/oauth2/token`,
+      };
       server = await startServer({ port: 34570, dataFile: dataR, seedToken: SEED, syncToken: SYNC, extraEnv: fcmEnv });
       r = await req(34570, "GET", "/health");
-      t("R: health fcmConfigured=true (key set hai)", r.json?.fcmConfigured === true, r.json);
+      t("R: health fcmConfigured=true (service account set hai)", r.json?.fcmConfigured === true, r.json);
       // R1: locked account + token wala register.
       await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM801A" }), syncH);
       r = await req(34570, "POST", "/api/device/register", { pairingCode: "FCM801AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-801" });
@@ -673,24 +785,24 @@ async function main() {
       // R2: payment sync (unlock) -> push.
       await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
       t("R: unlock sync ke baad push aata hai", await waitForPushes(1), pushes);
-      t("R: push shape — token + key header + data (unlocked)", pushes.length >= 1 && pushes[0].body?.to === "fcm-token-801" && pushes[0].auth === "key=test-fcm-key" && pushes[0].body?.data?.type === "amg_checkin" && pushes[0].body?.data?.reason === "unlocked" && pushes[0].body?.data?.dashboardAccountId === "801" && pushes[0].body?.priority === "high", pushes[0]);
+      t("R: push shape v1 — message.token + Bearer + data (unlocked) + HIGH", pushes.length >= 1 && pushes[0].body?.message?.token === "fcm-token-801" && pushes[0].auth === "Bearer stub-access-token" && pushes[0].body?.message?.data?.type === "amg_checkin" && pushes[0].body?.message?.data?.reason === "unlocked" && pushes[0].body?.message?.data?.dashboardAccountId === "801" && pushes[0].body?.message?.android?.priority === "HIGH", pushes[0]);
       // R3: dobara unlocked sync -> koi naya push nahi (transition nahi).
       await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
       await new Promise((x) => setTimeout(x, 500));
       t("R: dobara unlocked sync par naya push NAHI", pushes.length === 1, pushes.length);
-      // R4: dobara lock, phir completed -> push reason=completed.
+      // R4: dobara lock -> push reason=locked (J2-M13); phir completed -> push reason=completed.
       await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "locked", unlockCode: "FCM801B" }), syncH);
-      await new Promise((x) => setTimeout(x, 300));
-      t("R: lock transition par push NAHI (sirf unlock/completed par)", pushes.length === 1, pushes.length);
+      t("R: J2-M13 lock transition par push aata hai", await waitForPushes(2), pushes);
+      t("R: lock push reason=locked", pushes[1]?.body?.message?.data?.reason === "locked", pushes[1]);
       await req(34570, "POST", "/api/device/sync", syncBody(801, "FCM801AA", [inst(1, pktDate(-10), 10000, 10000)], { status: "completed", lockState: "unlocked", unlockCode: "" }), syncH);
-      t("R: completed sync ke baad push aata hai", await waitForPushes(2), pushes);
-      t("R: completed push reason=completed", pushes[1]?.body?.data?.reason === "completed", pushes[1]);
+      t("R: completed sync ke baad push aata hai", await waitForPushes(3), pushes);
+      t("R: completed push reason=completed", pushes[2]?.body?.message?.data?.reason === "completed", pushes[2]);
       // R5: token ke baghair register -> unlock par push nahi.
       await req(34570, "POST", "/api/device/sync", syncBody(802, "FCM802AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM802A" }), syncH);
       r = await register(34570, "FCM802AA");
       await req(34570, "POST", "/api/device/sync", syncBody(802, "FCM802AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
       await new Promise((x) => setTimeout(x, 500));
-      t("R: bina token account par push NAHI", pushes.length === 2, pushes.length);
+      t("R: bina token account par push NAHI", pushes.length === 3, pushes.length);
       r = await req(34570, "GET", "/api/device/status?dashboardAccountId=802", undefined, syncH);
       t("R: status fcmRegistered=false (bina token)", r.json?.fcmRegistered === false, r.json);
       // R6: check-in se token update hota hai.
@@ -700,12 +812,12 @@ async function main() {
       r = await req(34570, "POST", "/api/device/checkin", { deviceId: dev803, pairingCode: "FCM803AA", fcmToken: "fcm-token-803-new" });
       t("R: checkin fcmToken ke saath ok", r.json?.ok === true, r.json);
       await req(34570, "POST", "/api/device/sync", syncBody(803, "FCM803AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
-      t("R: checkin se mila token par push jata hai", await waitForPushes(3), pushes);
-      t("R: push naye token par gaya", pushes[2]?.body?.to === "fcm-token-803-new", pushes[2]);
-      // R7: token sync se nahi mitta (phone-side field).
-      r = await req(34570, "GET", "/api/test/accounts", undefined, seedH);
-      const acct801 = r.json?.accounts?.find((a) => a.dashboardAccountId === 801);
-      t("R: fcmToken sync ke baad bhi mehfooz hai", acct801?.fcmToken === "fcm-token-801", acct801);
+      t("R: checkin se mila token par push jata hai", await waitForPushes(4), pushes);
+      t("R: push naye token par gaya", pushes[3]?.body?.message?.token === "fcm-token-803-new", pushes[3]);
+      // R7: token sync se nahi mitta (phone-side field) — status se verify
+      // (dump mein token masked hai, J2-m19).
+      r = await req(34570, "GET", "/api/device/status?dashboardAccountId=801", undefined, syncH);
+      t("R: fcmToken sync ke baad bhi mehfooz hai (fcmRegistered)", r.json?.fcmRegistered === true, r.json);
       // R8: sync-all se unlock -> push bhi chalta hai (sirf transition wala account).
       await req(34570, "POST", "/api/device/sync", syncBody(804, "FCM804AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM804A" }), syncH);
       r = await req(34570, "POST", "/api/device/register", { pairingCode: "FCM804AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-804" });
@@ -715,24 +827,379 @@ async function main() {
         syncBody(803, "FCM803AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }),
         syncBody(804, "FCM804AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }),
       ] }, syncH);
-      t("R: sync-all unlock ke baad push aata hai (sirf 804 ka transition)", await waitForPushes(4), pushes);
-      t("R: sync-all push 804 ke token par", pushes[3]?.body?.to === "fcm-token-804" && pushes[3]?.body?.data?.dashboardAccountId === "804", pushes[3]);
+      t("R: sync-all unlock ke baad push aata hai (sirf 804 ka transition)", await waitForPushes(5), pushes);
+      t("R: sync-all push 804 ke token par", pushes[4]?.body?.message?.token === "fcm-token-804" && pushes[4]?.body?.message?.data?.dashboardAccountId === "804", pushes[4]);
+      // Token cache: 5 pushes, sirf 1 token call (server process mein cache).
+      t("R: access token cache hota hai (5 push = 1 token call)", stubTokenCalls === 1, stubTokenCalls);
+      // R10: dead token prune + lastPushError (J2-m21).
+      await req(34570, "POST", "/api/device/sync", syncBody(805, "FCM805AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM805A" }), syncH);
+      r = await req(34570, "POST", "/api/device/register", { pairingCode: "FCM805AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-dead" });
+      await req(34570, "POST", "/api/device/sync", syncBody(805, "FCM805AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
+      t("R: dead token par push koshish hoti hai", await waitForPushes(6), pushes);
+      await new Promise((x) => setTimeout(x, 500));
+      r = await req(34570, "GET", "/api/device/status?dashboardAccountId=805", undefined, syncH);
+      t("R: J2-m21 dead token prune ho jata hai (fcmRegistered=false)", r.json?.fcmRegistered === false, r.json);
+      t("R: J2-m21 lastPushError status mein nazar aata hai", r.json?.lastPushError === "fcm_token_not_found" && typeof r.json?.lastPushErrorAt === "string" && r.json.lastPushErrorAt.length > 0, r.json);
+      // Kamyab push ke baad lastPushError saaf ho jata hai.
+      r = await req(34570, "GET", "/api/device/status?dashboardAccountId=804", undefined, syncH);
+      t("R: kamyab push wale account par lastPushError khaali hai", r.json?.lastPushError === "", r.json);
       await stopServer(server); server = null;
-      // R9: FCM key set NAHI — sync theek chalta hai, push nahi aata.
+      // R9: FCM service account set NAHI — sync theek chalta hai, push nahi aata.
       const dataR2 = join(dir, "r2.json");
-      server = await startServer({ port: 34571, dataFile: dataR2, seedToken: SEED, syncToken: SYNC, extraEnv: { FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/fcm/send` } });
+      server = await startServer({ port: 34571, dataFile: dataR2, seedToken: SEED, syncToken: SYNC, extraEnv: { FCM_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/v1/projects/amg-test-project/messages:send`, FCM_TOKEN_ENDPOINT: `http://127.0.0.1:${fcmStubPort}/oauth2/token` } });
       r = await req(34571, "GET", "/health");
-      t("R: bina key health fcmConfigured=false", r.json?.fcmConfigured === false, r.json);
+      t("R: bina service account health fcmConfigured=false", r.json?.fcmConfigured === false, r.json);
       await req(34571, "POST", "/api/device/sync", syncBody(901, "FCM901AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "FCM901A" }), syncH);
       r = await req(34571, "POST", "/api/device/register", { pairingCode: "FCM901AA", imei: "1", model: "Pixel", androidVersion: "14", fcmToken: "fcm-token-901" });
       r = await req(34571, "POST", "/api/device/sync", syncBody(901, "FCM901AA", [inst(1, pktDate(-10), 10000, 10000)], { lockState: "unlocked", unlockCode: "" }), syncH);
-      t("R: bina key sync phir bhi ok", r.json?.ok === true, r.json);
+      t("R: bina service account sync phir bhi ok", r.json?.ok === true, r.json);
       await new Promise((x) => setTimeout(x, 500));
-      t("R: bina key koi push NAHI aata (no-op)", pushes.length === 4, pushes.length);
+      t("R: bina service account koi push NAHI aata (no-op)", pushes.length === 6, pushes.length);
       await stopServer(server); server = null;
     } finally {
       await new Promise((resolve) => fcmStub.close(resolve));
     }
+
+    // ---- Server S: J1-C03 regression — EXACT WS1c §2.1 sequence ----
+    console.log("\n== S. J1-C03: 24h window survives dashboard sync (exact sequence) ==");
+    const dataS = join(dir, "s.json");
+    server = await startServer({ port: 34572, dataFile: dataS, seedToken: SEED, syncToken: SYNC });
+    // S1: phone uses code -> dashboard adopts used state -> dashboard syncs.
+    await req(34572, "POST", "/api/device/sync", syncBody(1001, "TEST2026", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "KLMN89", resetPin: "4821" }), syncH);
+    r = await register(34572, "TEST2026");
+    const dev1001 = r.json.deviceId;
+    t("S1: register ok", r.json?.ok === true && typeof dev1001 === "string", r.json);
+    r = await checkin(34572, dev1001, "TEST2026");
+    t("S1: check-in lock_now + KLMN89", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "KLMN89", r.json);
+    r = await req(34572, "POST", "/api/device/offline-code-used", { deviceId: dev1001, code: "KLMN89" });
+    t("S1: code used -> window issued", r.json?.ok === true && typeof r.json?.offlineUnlockUntil === "string" && r.json.offlineUnlockUntil.length > 0, r.json);
+    const earnedS1 = r.json.offlineUnlockUntil;
+    r = await req(34572, "GET", "/api/device/status?dashboardAccountId=1001", undefined, syncH);
+    t("S1: status latch + window set after use", r.json?.offlineCodeUsed === true && r.json?.offlineUnlockUntil === earnedS1, r.json);
+    // Dashboard adoption sync: SAME code + adopted window + latch (UAT log ke mutabiq).
+    r = await req(34572, "POST", "/api/device/sync", syncBody(1001, "TEST2026", [inst(1, pktDate(-10), 10000)], { lockState: "unlocked", unlockCode: "KLMN89", offlineUnlockUntil: earnedS1, offlineCodeUsed: true }), syncH);
+    t("S1: adoption sync accepted", r.json?.ok === true, r.json);
+    r = await req(34572, "GET", "/api/device/status?dashboardAccountId=1001", undefined, syncH);
+    t("S1: J1-C03 window SURVIVES adoption sync", r.json?.offlineUnlockUntil === earnedS1, r.json);
+    t("S1: J1-C03 latch SURVIVES adoption sync", r.json?.offlineCodeUsed === true, r.json);
+    r = await checkin(34572, dev1001, "TEST2026");
+    t("S1: check-in after adoption stays unlocked (window)", r.json?.instruction === "stay_unlocked" && r.json?.offlineUnlockUntil === earnedS1, r.json);
+    // Agla lock (manual) — jala hua code dobara NAHI bheja jata (PU-S7 latch holds).
+    await req(34572, "POST", "/api/device/sync", syncBody(1001, "TEST2026", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "KLMN89" }), syncH);
+    r = await checkin(34572, dev1001, "TEST2026");
+    t("S1: J1-C03 next lock_now does NOT re-send burned code", r.json?.instruction === "lock_now" && !("offlineUnlockCode" in (r.json || {})), r.json);
+    // S2 (T2b): fresh code + adopted window -> window survives.
+    await req(34572, "POST", "/api/device/sync", syncBody(1002, "LOCKCOD2", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "AAAA11" }), syncH);
+    r = await register(34572, "LOCKCOD2");
+    const dev1002 = r.json.deviceId;
+    await checkin(34572, dev1002, "LOCKCOD2");
+    r = await req(34572, "POST", "/api/device/offline-code-used", { deviceId: dev1002, code: "AAAA11" });
+    const earnedS2 = r.json.offlineUnlockUntil;
+    await req(34572, "POST", "/api/device/sync", syncBody(1002, "LOCKCOD2", [inst(1, pktDate(-10), 10000)], { lockState: "unlocked", unlockCode: "ZZ99ZZ", offlineUnlockUntil: earnedS2, offlineCodeUsed: true }), syncH);
+    r = await req(34572, "GET", "/api/device/status?dashboardAccountId=1002", undefined, syncH);
+    t("S2: window survives fresh-code adoption sync", r.json?.offlineUnlockUntil === earnedS2 && r.json?.offlineCodeUsed === true, r.json);
+    // S3: routine sync (same code, NO restore fields) after code use -> window survives.
+    await req(34572, "POST", "/api/device/sync", syncBody(1003, "ROUT1003", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "RT1003A" }), syncH);
+    r = await register(34572, "ROUT1003");
+    const dev1003 = r.json.deviceId;
+    await checkin(34572, dev1003, "ROUT1003");
+    r = await req(34572, "POST", "/api/device/offline-code-used", { deviceId: dev1003, code: "RT1003A" });
+    const earnedS3 = r.json.offlineUnlockUntil;
+    await req(34572, "POST", "/api/device/sync", syncBody(1003, "ROUT1003", [inst(1, pktDate(-10), 10000)], { lockState: "unlocked", unlockCode: "RT1003A", shopPhone: "03005556666" }), syncH);
+    r = await req(34572, "GET", "/api/device/status?dashboardAccountId=1003", undefined, syncH);
+    t("S3: routine sync (same code, no restore) keeps window + latch", r.json?.offlineUnlockUntil === earnedS3 && r.json?.offlineCodeUsed === true, r.json);
+    // S4: fresh code WITHOUT restore after use -> PU-M1 latch reset still holds.
+    await req(34572, "POST", "/api/device/sync", syncBody(1004, "S41004AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "S4AAAA" }), syncH);
+    r = await register(34572, "S41004AA");
+    const dev1004 = r.json.deviceId;
+    await checkin(34572, dev1004, "S41004AA");
+    await req(34572, "POST", "/api/device/offline-code-used", { deviceId: dev1004, code: "S4AAAA" });
+    await req(34572, "POST", "/api/device/sync", syncBody(1004, "S41004AA", [inst(1, pktDate(-10), 10000)], { lockState: "unlocked", unlockCode: "S4BBBB" }), syncH);
+    r = await req(34572, "GET", "/api/device/status?dashboardAccountId=1004", undefined, syncH);
+    t("S4: fresh code WITHOUT restore resets latch + clears window (PU-M1)", r.json?.offlineCodeUsed === false && r.json?.offlineUnlockUntil === "", r.json);
+    r = await checkin(34572, dev1004, "S41004AA");
+    t("S4: re-lock ke baad lock_now WITH fresh code", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "S4BBBB", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server T: J1-M23 sync-all atomicity ----
+    console.log("\n== T. J1-M23: sync-all atomic (failed batch changes NOTHING) ==");
+    const dataT = join(dir, "t.json");
+    server = await startServer({ port: 34573, dataFile: dataT, seedToken: SEED, syncToken: SYNC });
+    await req(34573, "POST", "/api/device/sync", syncBody(1101, "AT1101AA", [inst(1, pktDate(30), 5000)]), syncH);
+    await req(34573, "POST", "/api/device/sync", syncBody(1103, "AT1103AA", [inst(1, pktDate(30), 5000)]), syncH);
+    // Failed batch: 1101 updated (locked) + 1102 NEW without pairingCode.
+    const bad1102 = syncBody(1102, undefined, [inst(1, pktDate(30), 5000)]);
+    delete bad1102.pairingCode;
+    r = await req(34573, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(1101, "AT1101AA", [inst(1, pktDate(30), 5000)], { lockState: "locked", unlockCode: "AT1101X" }), bad1102] }, syncH);
+    t("T: sync-all rejects (400)", r.status === 400 && r.json?.error === "invalid_sync_payload", r.json);
+    r = await req(34573, "GET", "/api/device/status?dashboardAccountId=1103", undefined, syncH);
+    t("T: J1-M23 1103 survives the failed sync-all (not deleted)", r.json?.ok === true && r.json?.dashboardAccountId === 1103, r.json);
+    r = await req(34573, "GET", "/api/device/status?dashboardAccountId=1101", undefined, syncH);
+    t("T: J1-M23 1101 UNCHANGED by failed sync-all (still unlocked)", r.json?.ok === true && r.json?.lockState === "unlocked", r.json);
+    r = await req(34573, "GET", "/api/device/status?dashboardAccountId=1102", undefined, syncH);
+    t("T: 1102 was not created", r.json?.ok === false && r.json?.error === "account_not_found", r.json);
+    // A valid sync-all afterwards still works.
+    r = await req(34573, "POST", "/api/device/sync-all", { shopId: 1, accounts: [syncBody(1101, "AT1101AA", [inst(1, pktDate(30), 5000)], { lockState: "locked", unlockCode: "AT1101X" }), syncBody(1103, "AT1103AA", [inst(1, pktDate(30), 5000)])] }, syncH);
+    t("T: valid sync-all after failure works", r.json?.ok === true && r.json?.synced === 2, r.json);
+    r = await req(34573, "GET", "/api/device/status?dashboardAccountId=1101", undefined, syncH);
+    t("T: 1101 locked only by the VALID sync-all", r.json?.lockState === "locked", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server U: J1-M24 shop-WiFi scenario + J2-m28 reregister 403 ----
+    console.log("\n== U. J1-M24 shop Wi-Fi + J2-m28 reregister_blocked not counted ==");
+    const dataU = join(dir, "u.json");
+    server = await startServer({ port: 34574, dataFile: dataU, seedToken: SEED, syncToken: SYNC });
+    await req(34574, "POST", "/api/device/sync", syncBody(1301, "SHOP1301", [inst(1, pktDate(30), 10000)]), syncH);
+    // Audit C1 ulat: aik hi IP se 10 ghalat register — sahi code usi IP se chalta hai.
+    const shopWifi = { "x-forwarded-for": "203.0.113.50" };
+    for (let i = 0; i < 10; i++) {
+      await req(34574, "POST", "/api/device/register", { pairingCode: "BADCODE1", imei: "", model: "X", androidVersion: "14" }, shopWifi);
+    }
+    r = await req(34574, "POST", "/api/device/register", { pairingCode: "SHOP1301", imei: "1", model: "X", androidVersion: "14" }, shopWifi);
+    t("U: J1-M24 valid register from the SAME shop Wi-Fi still works", r.json?.ok === true, r.json);
+    const dev1301 = r.json.deviceId;
+    // J2-m28: 10x reregister_blocked (403) -> koi 429 nahi, aur
+    // sahi deviceId se re-register ab bhi chalta hai.
+    let got403 = 0, got429 = false;
+    for (let i = 0; i < 10; i++) {
+      r = await req(34574, "POST", "/api/device/register", { pairingCode: "SHOP1301", imei: "9", model: "Other", androidVersion: "14" });
+      if (r.status === 403 && r.json?.error === "reregister_blocked") got403 += 1;
+      if (r.status === 429) got429 = true;
+    }
+    t("U: J2-m28 10x reregister_blocked, kabhi 429 nahi", got403 === 10 && got429 === false, { got403, got429 });
+    r = await req(34574, "POST", "/api/device/register", { pairingCode: "SHOP1301", imei: "1", model: "X", androidVersion: "14", deviceId: dev1301 });
+    t("U: J2-m28 same-device re-register after 10x 403 still works", r.json?.ok === true, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server V: J2-M10 atomic save + backup, J2-M11 body limits, J2-m24 seed, J2-m26 caps ----
+    console.log("\n== V. J2-M10 backup + J2-M11 body limits + J2-m24 seed + J2-m26 caps ==");
+    const dataV = join(dir, "v.json");
+    server = await startServer({ port: 34575, dataFile: dataV, seedToken: SEED, syncToken: SYNC });
+    // .bak banane ke liye do alag saves (debounce 200ms — beech mein rukna zaroori hai).
+    await req(34575, "POST", "/api/device/sync", syncBody(1401, "BAK1401A", [inst(1, pktDate(30), 5000)]), syncH);
+    await new Promise((x) => setTimeout(x, 400));
+    await req(34575, "POST", "/api/device/sync", syncBody(1402, "BAK1402A", [inst(1, pktDate(30), 5000)]), syncH);
+    await new Promise((x) => setTimeout(x, 400));
+    t("V: J2-M10 .bak file maujood hai (aakhri achha save)", existsSync(dataV + ".bak"), dataV + ".bak");
+    // Asal file kharab karein, restart karein — backup se wapas aana chahiye.
+    writeFileSync(dataV, "{ye kharab json hai");
+    await stopServer(server); server = null;
+    server = await startServer({ port: 34575, dataFile: dataV, seedToken: SEED, syncToken: SYNC });
+    r = await req(34575, "GET", "/api/device/status?dashboardAccountId=1401", undefined, syncH);
+    t("V: J2-M10 corrupt data.json -> backup se 1401 wapas aata hai", r.json?.ok === true && r.json?.dashboardAccountId === 1401, r.json);
+    // Body limits.
+    const big5mb = JSON.stringify({ pairingCode: "X".repeat(5 * 1024 * 1024) });
+    r = await req(34575, "POST", "/api/device/register", big5mb);
+    t("V: J2-M11 5MB body register par -> 413 body_too_large", r.status === 413 && r.json?.error === "body_too_large", r.status);
+    const big2mb = JSON.stringify({ x: "Y".repeat(2 * 1024 * 1024) });
+    r = await req(34575, "POST", "/api/device/register", big2mb);
+    t("V: J2-M11 2MB body register par -> 413 (had 1MB)", r.status === 413, r.status);
+    r = await req(34575, "POST", "/api/device/sync-all", big2mb, syncH);
+    t("V: J2-M11 2MB body sync-all par 413 NAHI (had 5MB)", r.status !== 413, r.status);
+    const big6mb = JSON.stringify({ x: "Z".repeat(6 * 1024 * 1024) });
+    r = await req(34575, "POST", "/api/device/sync-all", big6mb, syncH);
+    t("V: J2-M11 6MB body sync-all par -> 413", r.status === 413 && r.json?.error === "body_too_large", r.status);
+    // Seed validation.
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 2, firstDueDate: "not-a-date" }, seedH);
+    t("V: J2-m24 seed kharab firstDueDate -> 400 (500 nahi)", r.status === 400 && r.json?.error === "invalid_seed_payload", r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 0 }, seedH);
+    t("V: J2-m24 seed months 0 -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 61 }, seedH);
+    t("V: J2-m24 seed months 61 -> 400 (had 60)", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 2.5 }, seedH);
+    t("V: J2-m24 seed months 2.5 -> 400 (integer lazmi)", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: -5, months: 2 }, seedH);
+    t("V: J2-m24 seed negative total -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 2, graceDays: -1 }, seedH);
+    t("V: J2-m24 seed negative graceDays -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/test/seed", { total: 10000, months: 2, firstDueDate: pktDate(30) }, seedH);
+    t("V: J2-m24 valid seed ab bhi ok", r.json?.ok === true && typeof r.json?.pairingCode === "string", r.json);
+    // String/number caps.
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", [inst(1, pktDate(30), 10000)], { shopName: "S".repeat(201) }), syncH);
+    t("V: J2-m26 shopName 201 chars -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", [inst(1, pktDate(30), 10000)], { customerName: "C".repeat(201) }), syncH);
+    t("V: J2-m26 customerName 201 chars -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", [inst(1, pktDate(30), 10000)], { graceDays: 366 }), syncH);
+    t("V: J2-m26 graceDays 366 -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", [inst(1, pktDate(30), 2000000000)]), syncH);
+    t("V: J2-m26 amount 2 arab -> 400", r.status === 400, r.json);
+    const manyInst = Array.from({ length: 121 }, (_, i) => inst(i + 1, pktDate(30 + i), 100));
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", manyInst), syncH);
+    t("V: J2-m26 121 installments -> 400 (had 120)", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "C".repeat(33), [inst(1, pktDate(30), 10000)]), syncH);
+    t("V: J2-m26 pairingCode 33 chars -> 400", r.status === 400, r.json);
+    r = await req(34575, "POST", "/api/device/sync", syncBody(1403, "CAP1403A", [inst(1, pktDate(30), 10000)], { shopName: "S".repeat(200) }), syncH);
+    t("V: J2-m26 had ke andar (200 chars) ok", r.json?.ok === true, r.json);
+    await stopServer(server); server = null;
+    // Corrupt main + NO backup -> khaali shuruaat (koi crash nahi).
+    const dataW = join(dir, "w.json");
+    writeFileSync(dataW, "{bilkul kharab");
+    server = await startServer({ port: 34576, dataFile: dataW, seedToken: SEED, syncToken: SYNC });
+    r = await req(34576, "GET", "/api/test/accounts", undefined, seedH);
+    t("V: corrupt file + no backup -> khaali shuruaat, server chalta hai", Array.isArray(r.json?.accounts) && r.json.accounts.length === 0, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server W: J2-M12 ambiguity + contract (dashboardAccountId, pairing_code_changed, schedule) ----
+    console.log("\n== W. J2-M12 ambiguity + contract additions ==");
+    const dataX = join(dir, "x.json");
+    server = await startServer({ port: 34577, dataFile: dataX, seedToken: SEED, syncToken: SYNC });
+    await req(34577, "POST", "/api/device/sync", syncBody(1501, "SAMECODE", [inst(1, pktDate(30), 10000)]), syncH);
+    await req(34577, "POST", "/api/device/sync", syncBody(1502, "SAMECODE", [inst(1, pktDate(30), 10000)], { shopId: 2 }), syncH);
+    r = await register(34577, "SAMECODE");
+    t("W: J2-M12 duplicate pairing code -> pairing_code_ambiguous (first-match nahi)", r.json?.ok === false && r.json?.error === "pairing_code_ambiguous", r.json);
+    r = await req(34577, "GET", "/api/device/status?dashboardAccountId=1501", undefined, syncH);
+    const reg1501 = r.json?.deviceRegistered;
+    r = await req(34577, "GET", "/api/device/status?dashboardAccountId=1502", undefined, syncH);
+    t("W: J2-M12 ambiguous register kisi account ko bind nahi karta", reg1501 === false && r.json?.deviceRegistered === false, { reg1501, reg1502: r.json?.deviceRegistered });
+    // Register response mein dashboardAccountId.
+    await req(34577, "POST", "/api/device/sync", syncBody(1503, "W1503AAA", [inst(1, pktDate(30), 10000), inst(2, pktDate(60), 10000, 4000), inst(3, pktDate(90), 10000)]), syncH);
+    r = await register(34577, "W1503AAA");
+    t("W: register response mein dashboardAccountId (dashboard ki id)", r.json?.ok === true && r.json?.dashboardAccountId === 1503, r.json);
+    const dev1503 = r.json.deviceId;
+    r = await req(34577, "POST", "/api/test/seed", { total: 10000, months: 1, firstDueDate: pktDate(30) }, seedH);
+    r = await register(34577, r.json.pairingCode);
+    t("W: seed register par dashboardAccountId null", r.json?.ok === true && r.json?.dashboardAccountId === null, r.json);
+    // Check-in schedule + graceDays.
+    r = await checkin(34577, dev1503, "W1503AAA");
+    t("W: check-in mein schedule (seq/dueDate/amount/paidAmount) + graceDays", Array.isArray(r.json?.schedule) && r.json.schedule.length === 3 && r.json.schedule[1]?.seq === 2 && r.json.schedule[1]?.paidAmount === 4000 && r.json.schedule[1]?.amount === 10000 && r.json?.graceDays === 5, r.json);
+    // Pairing code regenerate -> check-in pairing_code_changed.
+    await req(34577, "POST", "/api/device/sync", syncBody(1503, "W1503NEW", [inst(1, pktDate(30), 10000), inst(2, pktDate(60), 10000, 4000), inst(3, pktDate(90), 10000)]), syncH);
+    r = await checkin(34577, dev1503, "W1503AAA");
+    t("W: purani pairing code par check-in -> pairing_code_changed", r.json?.ok === false && r.json?.error === "pairing_code_changed", r.json);
+    r = await checkin(34577, dev1503, "W1503NEW");
+    t("W: nayi pairing code se check-in ok", r.json?.ok === true, r.json);
+    r = await checkin(34577, dev1503);
+    t("W: pairing code na bheji jaye to check-in ok (optional hai)", r.json?.ok === true, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server X: J2-m25 sync sequence + J2-m27 lock flap ----
+    console.log("\n== X. J2-m25 sync sequence + J2-m27 lock flap ==");
+    const dataY = join(dir, "y.json");
+    server = await startServer({ port: 34578, dataFile: dataY, seedToken: SEED, syncToken: SYNC });
+    // X1: single sync sequence.
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1601, "SQ1601AA", [inst(1, pktDate(30), 10000)], { syncSeq: 5 }), syncH);
+    t("X1: sync seq 5 applied", r.json?.ok === true && r.json?.stale !== true, r.json);
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1601, "SQ1601AA", [inst(1, pktDate(30), 10000)], { syncSeq: 5, lockState: "locked", unlockCode: "SQ1601X" }), syncH);
+    t("X1: J2-m25 same seq 5 -> stale (ignore)", r.json?.ok === true && r.json?.stale === true, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1601", undefined, syncH);
+    t("X1: stale sync ne lockState nahi badla", r.json?.lockState === "unlocked", r.json);
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1601, "SQ1601AA", [inst(1, pktDate(30), 10000)], { syncSeq: 4, lockState: "locked", unlockCode: "SQ1601X" }), syncH);
+    t("X1: J2-m25 older seq 4 -> stale", r.json?.ok === true && r.json?.stale === true, r.json);
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1601, "SQ1601AA", [inst(1, pktDate(30), 10000)], { syncSeq: 6, lockState: "locked", unlockCode: "SQ1601X" }), syncH);
+    t("X1: newer seq 6 applied", r.json?.ok === true && r.json?.stale !== true, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1601", undefined, syncH);
+    t("X1: seq 6 ke baad locked hai", r.json?.lockState === "locked", r.json);
+    // X2: sync-all batch sequence (per-shop watermark).
+    r = await req(34578, "POST", "/api/device/sync-all", { shopId: 5, syncSeq: 10, accounts: [syncBody(1602, "SQ1602AA", [inst(1, pktDate(30), 5000)], { shopId: 5 })] }, syncH);
+    t("X2: sync-all batch seq 10 applied", r.json?.ok === true && r.json?.synced === 1, r.json);
+    r = await req(34578, "POST", "/api/device/sync-all", { shopId: 5, syncSeq: 9, accounts: [syncBody(1602, "SQ1602AA", [inst(1, pktDate(30), 5000)], { shopId: 5, lockState: "locked", unlockCode: "SQ1602X" }), syncBody(1603, "SQ1603AA", [inst(1, pktDate(30), 5000)], { shopId: 5 })] }, syncH);
+    t("X2: J2-m25 poora purana batch stale (synced 0)", r.json?.ok === true && r.json?.stale === true && r.json?.synced === 0, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1602", undefined, syncH);
+    t("X2: stale batch ne 1602 nahi badla", r.json?.lockState === "unlocked", r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1603", undefined, syncH);
+    t("X2: stale batch ne 1603 nahi banaya", r.json?.ok === false && r.json?.error === "account_not_found", r.json);
+    r = await req(34578, "POST", "/api/device/sync-all", { shopId: 5, syncSeq: 11, accounts: [syncBody(1602, "SQ1602AA", [inst(1, pktDate(30), 5000)], { shopId: 5, lockState: "locked", unlockCode: "SQ1602X" })] }, syncH);
+    t("X2: newer batch seq 11 applied", r.json?.ok === true && r.json?.synced === 1, r.json);
+    // X3: sync-all mein per-entry stale (aik entry skip, doosri apply).
+    await req(34578, "POST", "/api/device/sync", syncBody(1604, "SQ1604AA", [inst(1, pktDate(30), 10000)], { shopId: 6, syncSeq: 7 }), syncH);
+    r = await req(34578, "POST", "/api/device/sync-all", { shopId: 6, accounts: [syncBody(1604, "SQ1604AA", [inst(1, pktDate(30), 10000)], { shopId: 6, syncSeq: 6, lockState: "locked", unlockCode: "SQ1604X" }), syncBody(1605, "SQ1605AA", [inst(1, pktDate(30), 10000)], { shopId: 6 })] }, syncH);
+    t("X3: sync-all per-entry stale -> synced 1, stale 1", r.json?.ok === true && r.json?.synced === 1 && r.json?.stale === 1, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1604", undefined, syncH);
+    t("X3: stale entry ne 1604 nahi badla (aur delete bhi nahi hua)", r.json?.ok === true && r.json?.lockState === "unlocked", r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1605", undefined, syncH);
+    t("X3: taaza entry 1605 ban gayi", r.json?.ok === true, r.json);
+    // X4: lock flap (J2-m27) — server-side auto-lock purani sync se wapas nahi hota.
+    await req(34578, "POST", "/api/device/sync", syncBody(1606, "SQ1606AA", [inst(1, pktDate(-10), 10000)], { syncSeq: 5 }), syncH);
+    r = await register(34578, "SQ1606AA");
+    const dev1606 = r.json.deviceId;
+    r = await checkin(34578, dev1606, "SQ1606AA");
+    t("X4: check-in auto-lock (server-side)", r.json?.instruction === "lock_now", r.json);
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1606, "SQ1606AA", [inst(1, pktDate(-10), 10000)], { syncSeq: 5, lockState: "unlocked" }), syncH);
+    t("X4: J2-m27 stale sync (seq 5) lock wapas nahi karti", r.json?.stale === true, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1606", undefined, syncH);
+    t("X4: server-side lock qaim hai", r.json?.lockState === "locked", r.json);
+    r = await req(34578, "POST", "/api/device/sync", syncBody(1606, "SQ1606AA", [inst(1, pktDate(-10), 10000)], { syncSeq: 6, lockState: "unlocked" }), syncH);
+    t("X4: J2-m27 taaza sync (seq 6) explicit unlock jeet-ti hai", r.json?.ok === true && r.json?.stale !== true, r.json);
+    r = await req(34578, "GET", "/api/device/status?dashboardAccountId=1606", undefined, syncH);
+    t("X4: taaza sync ke baad unlocked hai", r.json?.lockState === "unlocked", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server Y: J2-m20 check-in rate limit + save-on-change ----
+    console.log("\n== Y. J2-m20 check-in rate limit + save-on-change ==");
+    const dataZ = join(dir, "z.json");
+    server = await startServer({ port: 34579, dataFile: dataZ, seedToken: SEED, syncToken: SYNC });
+    await req(34579, "POST", "/api/device/sync", syncBody(1701, "CI1701AA", [inst(1, pktDate(30), 10000)]), syncH);
+    r = await register(34579, "CI1701AA");
+    const dev1701 = r.json.deviceId;
+    await new Promise((x) => setTimeout(x, 400)); // register ka save flush ho jaye
+    const fileAfterRegister = JSON.parse(readFileSync(dataZ, "utf8"));
+    const seenAfterRegister = fileAfterRegister.accounts.find((a) => a.dashboardAccountId === 1701)?.lastSeenAt;
+    // Pehla check-in: lastSeenAt save hota hai (60s window mein pehla).
+    await checkin(34579, dev1701, "CI1701AA");
+    await new Promise((x) => setTimeout(x, 400));
+    const fileAfterCi1 = JSON.parse(readFileSync(dataZ, "utf8"));
+    const seenAfterCi1 = fileAfterCi1.accounts.find((a) => a.dashboardAccountId === 1701)?.lastSeenAt;
+    t("Y: pehla check-in lastSeenAt save karta hai", typeof seenAfterCi1 === "string" && seenAfterCi1.length > 0 && seenAfterCi1 !== seenAfterRegister, { seenAfterRegister, seenAfterCi1 });
+    // Doosra foran check-in (koi tabdeeli nahi) — file NAHI badalti.
+    await checkin(34579, dev1701, "CI1701AA");
+    await new Promise((x) => setTimeout(x, 400));
+    const fileAfterCi2 = JSON.parse(readFileSync(dataZ, "utf8"));
+    const seenAfterCi2 = fileAfterCi2.accounts.find((a) => a.dashboardAccountId === 1701)?.lastSeenAt;
+    t("Y: J2-m20 tabdeeli ke baghair check-in file nahi likhta", seenAfterCi2 === seenAfterCi1, { seenAfterCi1, seenAfterCi2 });
+    // Token tabdeeli wala check-in — save hota hai.
+    await req(34579, "POST", "/api/device/checkin", { deviceId: dev1701, pairingCode: "CI1701AA", fcmToken: "tok-y2" });
+    await new Promise((x) => setTimeout(x, 400));
+    const fileAfterCi3 = JSON.parse(readFileSync(dataZ, "utf8"));
+    t("Y: J2-m20 tabdeeli wala check-in save karta hai (token likha gaya)", fileAfterCi3.accounts.find((a) => a.dashboardAccountId === 1701)?.fcmToken === "tok-y2", fileAfterCi3.accounts.find((a) => a.dashboardAccountId === 1701));
+    // Rate limit: 20/minute — ab tak 3 check-in ho chuke, 17 aur ok, phir 429.
+    let okCount = 0;
+    for (let i = 0; i < 17; i++) {
+      r = await checkin(34579, dev1701, "CI1701AA");
+      if (r.json?.ok === true) okCount += 1;
+    }
+    t("Y: J2-m20 20 check-in/minute tak sab ok", okCount === 17, okCount);
+    r = await checkin(34579, dev1701, "CI1701AA");
+    t("Y: J2-m20 21st check-in -> 429 too_many_attempts", r.status === 429 && r.json?.error === "too_many_attempts", r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server Z: lockApp guard + status window expiry + dump redaction + warn boundary ----
+    console.log("\n== Z. lockApp guard + status window + dump redaction + warn boundary ==");
+    const dataZZ = join(dir, "zz.json");
+    server = await startServer({ port: 34581, dataFile: dataZZ, seedToken: SEED, syncToken: SYNC });
+    // lockApp guard (contract): TV/fridge par lock refuse hota hai.
+    r = await req(34581, "POST", "/api/device/sync", syncBody(1801, "TV1801AA", [inst(1, pktDate(-10), 10000)], { lockApp: false, lockState: "locked", unlockCode: "TV1801X" }), syncH);
+    t("Z: lockApp:false + locked -> 400 lock_not_allowed", r.status === 400 && r.json?.error === "lock_not_allowed", r.json);
+    r = await req(34581, "POST", "/api/device/sync", syncBody(1801, "TV1801AA", [inst(1, pktDate(-10), 10000)], { lockApp: false, lockState: "warned" }), syncH);
+    t("Z: lockApp:false + warned -> 400 lock_not_allowed", r.status === 400 && r.json?.error === "lock_not_allowed", r.json);
+    r = await req(34581, "POST", "/api/device/sync", syncBody(1801, "TV1801AA", [inst(1, pktDate(-10), 10000)], { lockApp: false, lockState: "unlocked" }), syncH);
+    t("Z: lockApp:false + unlocked ok", r.json?.ok === true, r.json);
+    r = await register(34581, "TV1801AA");
+    const dev1801 = r.json.deviceId;
+    r = await checkin(34581, dev1801, "TV1801AA");
+    t("Z: lockApp:false account grace guzre bhi auto-lock NAHI (stay_unlocked)", r.json?.instruction === "stay_unlocked", r.json);
+    // sync-all mein lockApp wali kharab entry -> poora batch 400, kuch nahi badla.
+    await req(34581, "POST", "/api/device/sync", syncBody(1802, "TV1802AA", [inst(1, pktDate(30), 10000)], { shopId: 7 }), syncH);
+    r = await req(34581, "POST", "/api/device/sync-all", { shopId: 7, accounts: [syncBody(1802, "TV1802AA", [inst(1, pktDate(30), 10000)], { shopId: 7, lockState: "locked", unlockCode: "TV1802X" }), syncBody(1803, "TV1803AA", [inst(1, pktDate(30), 10000)], { shopId: 7, lockApp: false, lockState: "locked", unlockCode: "TV1803X" })] }, syncH);
+    t("Z: sync-all mein lockApp entry -> 400 lock_not_allowed", r.status === 400 && r.json?.error === "lock_not_allowed", r.json);
+    r = await req(34581, "GET", "/api/device/status?dashboardAccountId=1802", undefined, syncH);
+    t("Z: failed sync-all ne 1802 nahi badla (atomic)", r.json?.lockState === "unlocked", r.json);
+    // Status window expiry (J2-m23).
+    await req(34581, "POST", "/api/device/sync", syncBody(1804, "SW1804AA", [inst(1, pktDate(-10), 10000)], { offlineUnlockUntil: "2020-01-01T00:00:00.000Z", offlineCodeUsed: true }), syncH);
+    r = await req(34581, "GET", "/api/device/status?dashboardAccountId=1804", undefined, syncH);
+    t("Z: J2-m23 status guzri hui window nahi dikhata", r.json?.offlineUnlockUntil === "", r.json);
+    // Dump redaction (J2-m19).
+    await req(34581, "POST", "/api/device/sync", syncBody(1805, "RD1805AA", [inst(1, pktDate(30), 10000)], { lockState: "locked", unlockCode: "RD1805X", resetPin: "1357" }), syncH);
+    r = await req(34581, "POST", "/api/device/register", { pairingCode: "RD1805AA", imei: "android-id-xyz", model: "Pixel", androidVersion: "14", fcmToken: "fcm-secret-token" });
+    r = await req(34581, "GET", "/api/test/accounts", undefined, seedH);
+    const acct1805 = r.json?.accounts?.find((a) => a.dashboardAccountId === 1805);
+    t("Z: J2-m19 dump mein codes/PINs/tokens masked", acct1805?.pairingCode === "***" && acct1805?.unlockCode === "***" && acct1805?.resetPin === "***" && acct1805?.deviceId === "***" && acct1805?.fcmToken === "***" && acct1805?.imei === "***", acct1805);
+    t("Z: J2-m19 dump mein ghair-secret fields nazar aate hain", acct1805?.dashboardAccountId === 1805 && acct1805?.lockState === "locked" && acct1805?.shopName === "Al Arab Electronic", acct1805);
+    // Warn boundary extra (J1-m53): future due par graceDaysLeft poora grace (36 nahi).
+    await req(34581, "POST", "/api/device/sync", syncBody(1806, "WB1806AA", [inst(1, pktDate(30), 10000)]), syncH);
+    r = await register(34581, "WB1806AA");
+    r = await checkin(34581, r.json.deviceId, "WB1806AA");
+    t("Z: J1-m53 future due -> stay_unlocked + graceDaysLeft=5", r.json?.instruction === "stay_unlocked" && r.json?.graceDaysLeft === 5, r.json);
+    await stopServer(server); server = null;
   } finally {
     await stopServer(server);
     rmSync(dir, { recursive: true, force: true });

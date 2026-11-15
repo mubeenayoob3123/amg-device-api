@@ -1,4 +1,4 @@
-# AMG Device API — dashboard ka phone wala hissa (UNIFIED v2.1 + FCM, health version `unified-3`)
+# AMG Device API — dashboard ka phone wala hissa (UNIFIED v2.1 + FCM HTTP v1, health version `unified-4`)
 
 ## Seedhi baat — ye kya hai?
 
@@ -18,23 +18,38 @@ sync hoti hai. (Pehle ye sirf test wala bridge tha — ab wo daur khatam hai.)
 Lock app EXACTLY ye 3 raaste mangti hai:
 
 - `POST /api/device/register` — `{ pairingCode, imei, model, androidVersion,
-  deviceId?, fcmToken? }` → `deviceId`, `accountId`, `shopName`,
+  deviceId?, fcmToken? }` → `deviceId`, `accountId`, `dashboardAccountId`
+  (unified-4 — dashboard ki id, server ki androoni id nahi), `shopName`,
   `shopPhone`, `resetPin` (v2.1). Pehle se registered account par dobara
   register sirf purane `deviceId` ya naye pairing code se hota hai, warna
-  `403 reregister_blocked`. Ghalat koshishon par rate limit hai
-  (10/ghanta → 1 ghante ki rok, `429 too_many_attempts`).
+  `403 reregister_blocked` (ye 403 rate limit mein nahi gina jata).
+  Ghalat koshishon par rate limit hai (10/ghanta → 1 ghante ki rok,
+  `429 too_many_attempts`) — limit PAIRING CODE par hai, IP par nahi
+  (shop ki Wi-Fi par aik phone ki ghaltiyan doosre ko nahi rokti).
+  Aik hi code do accounts par ho to register `pairing_code_ambiguous`
+  de kar refuse karta hai (pehle match par bandhna band hai).
 - `POST /api/device/checkin` — `{ deviceId, pairingCode, fcmToken? }` →
-  `stay_unlocked` | `warn` | `lock_now` | `permanent_unlock`
-- `POST /api/device/offline-code-used` — `{ deviceId, code }`
+  `stay_unlocked` | `warn` | `lock_now` | `permanent_unlock`.
+  Dashboard ne pairing code dobara bana diya ho to check-in
+  `pairing_code_changed` deta hai (dobara register karna hota hai).
+  Check-in par per-device rate limit hai (1 minute mein 20).
+- `POST /api/device/offline-code-used` — `{ deviceId, code }` (rate
+  limit deviceId par hai, IP par nahi).
 
 Check-in ke jawab mein: `overdueAmount` / `overdueDueDate` / `overdueCount`
 (sirf OVERDUE qist ki raqam, poora balance nahi), `nextDueDate` /
 `monthlyAmount`, `shopPhone`, lock par `offlineUnlockCode`, aur 24 ghante ki
 unlock window mein `offlineUnlockUntil`. v2.1 mein mazeed:
 `installmentNumber` / `installmentTotal` ("Qist #3 of 6") aur inclusive
-`graceDaysLeft` (aakhri grace din = 1). Offline code istemal par 24 ghante
-ki window shuru hoti hai — is doran phone unlocked rehta hai; window khatam
-hone par agar qist abhi bhi overdue hai to dobara lock ho jata hai.
+`graceDaysLeft` (aakhri grace din = 1). unified-4 mein mazeed: poori qist
+`schedule` (`[{seq, dueDate, amount, paidAmount}]`) + `graceDays` — lock app
+isay mehfooz kar ke offline deadline lock lagati hai. Warning due date ke
+AGLE din se lagti hai (due date khud reminder ka din hai); `graceDaysLeft`
+due date par poora grace dikhata hai (pehle grace+1 dikhta tha). Offline code
+istemal par 24 ghante ki window shuru hoti hai — is doran phone unlocked
+rehta hai; window khatam hone par agar qist abhi bhi overdue hai to dobara
+lock ho jata hai. Seed (test) accounts ka code ab har `lock_now` mein
+dobara bheja jata hai jab tak istemal na ho (pehle sirf pehli dafa milta tha).
 
 ## Sync API (dashboard ke liye)
 
@@ -62,31 +77,55 @@ badalte hain. Do istisna (v2.1): sync body mein saaf taur par bheji gayi
 dashboard ki adopted window wapas aati hai). Naya (mukhtalif, ghair-khaali)
 `unlockCode` naya lock cycle hai — latch reset, window saaf; `lockState:
 locked` wali sync window hamesha saaf kar deti hai (dukaan ka lock window se
-oopar hai). Synced account ka offline unlock code sirf dashboard deta hai;
-server synced accounts ke liye apna code KABHI nahi banata. `autoLock` sync
-hota hai: off ho to grace ke baad bhi AUTO-lock nahi lagta (warning phir bhi
-lagti hai); manual lock hamesha kaam karta hai. `resetPin` sync se aata hai
-aur register ke jawab mein phone ko milta hai.
+oopar hai). **unified-4 (J1-C03):** saaf restore bheji gayi ho to restore
+JEET-TI hai — naya code bhi kamaya hua 24h window nahi mita sakta; aur code
+istemal par server code ko `""` nahi karta (latch hi dobara istemal rokta
+hai, aur jala hua code dobara kabhi nahi bheja jata). Synced account ka
+offline unlock code sirf dashboard deta hai; server synced accounts ke liye
+apna code KABHI nahi banata. `autoLock` sync hota hai: off ho to grace ke
+baad bhi AUTO-lock nahi lagta (warning phir bhi lagti hai); manual lock
+hamesha kaam karta hai. `resetPin` sync se aata hai aur register ke jawab
+mein phone ko milta hai.
 
-## FCM push (Wave 5.4)
+**unified-4 mazeed:** sync-all ab waqai **atomic** hai (validate → clone par
+apply → swap + aik save; kharab batch live state ko haath nahi lagata).
+Sync mein optional **`syncSeq`** (per-account, monotonic) — purani sync
+ignore hoti hai (`stale: true`); sync-all mein top-level `syncSeq` (per-shop
+watermark) poora purana batch ignore kar deta hai. **`lockApp: false`**
+account par lock/warn refuse hota hai (`400 lock_not_allowed`) — TV/fridge
+par lock nahi lagta. Sync body ki had: strings 200 chars, codes 32 chars,
+grace 365 din, raqam Rs 1 arab, qistein 120 tak; POST body ki had device
+endpoints 1 MB, sync 5 MB (zyada par `413 body_too_large`).
+
+## FCM push (Wave 5.4, HTTP v1 — unified-4)
 
 Phone register/check-in mein apna FCM token bhejta hai (optional). Jab sync
-se koi account **unlocked** ya **completed** hota hai (transition — pehle se
-unlocked ki dobara sync par nahi), to server us token par data-only push
-bhejta hai: `{ type: "amg_checkin", reason: "unlocked"|"completed",
-dashboardAccountId }`. Push sirf "check-in karo" ka ishara hai — faisla
-hamesha check-in ka jawab karta hai. Phone push par foran check-in karta hai,
-taake payment ke baad phone 15 minute ka intezar kiye baghair khul jaye.
+se koi account **unlocked**, **completed** ya **LOCKED** hota hai (transition
+— pehle se unlocked ki dobara sync par nahi), to server us token par
+data-only push bhejta hai: `{ type: "amg_checkin",
+reason: "unlocked"|"completed"|"locked", dashboardAccountId }`. Push sirf
+"check-in karo" ka ishara hai — faisla hamesha check-in ka jawab karta hai.
+Phone push par foran check-in karta hai, taake payment ke baad phone 15
+minute ka intezar kiye baghair khul jaye (aur lock bhi foran lage).
 
-- Server key Render env var **`FCM_SERVER_KEY`** se aati hai (Firebase
-  console → Project Settings → Cloud Messaging → Server key; Mubeen ka
-  step — key kabhi chat ya file mein nahi likhni). Key set na ho to push
-  band hai (no-op + aik log line) — sync phir bhi theek chalta hai.
-- `/health` mein `fcmConfigured: true/false` aata hai; `/api/device/status`
-  mein `fcmRegistered: true/false` (is phone ka token hai ya nahi).
-- Send ka code **`fcm.mjs`** mein hai (legacy FCM HTTP API, koi dependency
-  nahi) — unit test mein fetch stub karke jaancha jata hai. `FCM_ENDPOINT`
-  env var SIRF test ke liye hai (local stub); Render par kabhi set nahi karna.
+- Auth **HTTP v1** hai: Firebase **service-account JSON** Render env var
+  **`FCM_SERVICE_ACCOUNT_JSON`** se aati hai (Firebase console → Project
+  settings → Service accounts → Generate new private key; Mubeen ka step —
+  key kabhi chat ya file mein nahi likhni). Server us se RS256 JWT sign kar
+  ke OAuth2 access token leta hai (token cache hota hai). **Purana
+  `FCM_SERVER_KEY` ab NAHI parha jata** — legacy FCM API Google ne June 2024
+  mein band kar diya tha (J1-C02); Render se purani key hata dein.
+  Service account set na ho to push band hai (no-op + aik log line) — sync
+  phir bhi theek chalta hai.
+- `/health` mein `fcmConfigured: true/false` aata hai (account counts ab
+  health mein nahi aate — baghair auth ke thay); `/api/device/status` mein
+  `fcmRegistered: true/false` (is phone ka token hai ya nahi) aur
+  `lastPushError` / `lastPushErrorAt` (aakhri push ghalti). Mara hua token
+  (UNREGISTERED) khud prune ho jata hai.
+- Send ka code **`fcm.mjs`** mein hai (HTTP v1 + OAuth2, koi dependency
+  nahi — sirf Node ka built-in `crypto`/`fetch`) — unit test mein fetch stub
+  karke jaancha jata hai. `FCM_ENDPOINT` / `FCM_TOKEN_ENDPOINT` env vars
+  SIRF test ke liye hain (local stub); Render par kabhi set nahi karna.
 - Poora setup tareeqa: `hidden_files/fcm-setup-guide.md` (Mubeen ke paas).
 
 ## Wipe ho jaye to kya hota hai?
@@ -95,7 +134,10 @@ Render free restart/redeploy par `data.json` mit sakti hai. Ghabrana nahi —
 asal data dashboard (`app.db`) mein mehfooz rehta hai. Dashboard se **sync-all**
 chalayein, replica dobara ban jata hai. Phone ko **dobara register** karna par
 sakta hai (deviceId bhi `data.json` mein tha) — wahi pairing code dobara kaam
-karta hai, code nahi badalta.
+karta hai, code nahi badalta. unified-4 mein `data.json` atomic likhi jati
+hai (temp file + rename) aur har save se pehle pichhli achhi copy
+`data.json.bak` mein rehti hai — file kharab ho jaye to server backup se
+wapas aa jata hai (khaamoshi se khaali shuruaat nahi hoti).
 
 ## Test accounts (purana tareeqa, ab bhi chalta hai)
 
@@ -106,7 +148,7 @@ karta hai, code nahi badalta.
 ## Free tier ki 2 kamzoriyan — test se pehle samajh lein
 
 - **Neend:** free service 15 minute khamoshi ke baad so jata hai, jagane mein
-  ~1 minute lagta hai. Phone ka check-in sirf 15 second intezar karta hai.
+  ~1 minute lagta hai. Phone ka check-in 60 second intezar karta hai.
   **Test se pehle browser mein server ka link khol kar jaga lein**, phir
   15 minute ke andar test karein.
 - **Data mit jata hai:** upar wipe wala hissa dekhein. Is server par asal
@@ -117,18 +159,24 @@ karta hai, code nahi badalta.
 ```bash
 cd live-server
 AMG_SEED_TOKEN=koi-mushkil-token AMG_SYNC_TOKEN=koi-aur-mushkil-token node server.mjs
-# phir http://localhost:3000/health kholein — {"ok":true,"version":"unified-3",...} aana chahiye
+# phir http://localhost:3000/health kholein — {"ok":true,"version":"unified-4",...} aana chahiye
 ```
 
 Tests (sab local, koi live data nahi chhoota):
 
 ```bash
 node unified-server-test.mjs
-# 165/165 pass — sync, sync-all shop scoping, autoLock, wipe recovery,
+# 269/269 pass — sync, sync-all shop scoping, autoLock, wipe recovery,
 # offline 24h window, sticky latch, seed/pay, validation, v2.1 (window
 # restore, new-code reset, manual-lock-wins, re-register guard, reset
 # PIN, code rotation, qist number, inclusive grace, addMonths clamp,
-# rate limiting, salted hash) + FCM send unit tests + FCM trigger
+# rate limiting, salted hash) + FCM HTTP v1 unit tests (JWT + token
+# cache + error paths) + FCM trigger (unlock/completed/LOCK push,
+# dead-token prune) + Audit R2 (J1-C03 exact sequence, J1-M23
+# atomicity, J1-M24 re-keyed limits, J2-M10 backup, J2-M11 body
+# limits, J2-M12 ambiguity, J2-m19 redaction, J2-m20 check-in limit
+# + save-on-change, J2-m23–m28, J2-p11–p13, J1-m53, J1-p16, lockApp
+# guard, syncSeq, schedule/graceDays, pairing_code_changed)
 ```
 
 ## Render par deploy
@@ -138,8 +186,9 @@ node unified-server-test.mjs
 - Start command: `node server.mjs` (koi dependency nahi).
 - Environment variables: `AMG_SEED_TOKEN` (test accounts), `AMG_SYNC_TOKEN`
   (dashboard sync — dashboard ke Master setup card se milta hai),
-  `FCM_SERVER_KEY` (push — Firebase console ki server key; set na ho to
-  push band hai, baqi sab chalta hai).
+  `FCM_SERVICE_ACCOUNT_JSON` (push — Firebase service-account JSON, poora;
+  set na ho to push band hai, baqi sab chalta hai). Purana
+  `FCM_SERVER_KEY` hata dein — ab kaam nahi karta.
 - Live link: `https://amg-device-api.onrender.com`
 
 Files: `server.mjs` + `fcm.mjs` (Node 18+, koi dependency nahi). Data: paas wali `data.json`
