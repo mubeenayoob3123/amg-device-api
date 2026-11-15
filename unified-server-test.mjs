@@ -1,4 +1,4 @@
-// AMG unified device API v2.1 + FCM HTTP v1 (unified-4, Audit Round 2 fixes)
+// AMG unified device API v2.1 + FCM HTTP v1 (unified-4.1, Audit Round 2 fixes + J2-m36/J2-m29)
 // — local test battery (plain node, no deps)
 // Chalana:  node unified-server-test.mjs
 // Ye test server ko scratch port + temp data file ke saath chalata hai,
@@ -110,7 +110,7 @@ async function main() {
     r = await req(34561, "GET", "/api/device/status?dashboardAccountId=1", undefined, syncH);
     t("status bina token env -> 403 sync_disabled", r.status === 403 && r.json?.error === "sync_disabled", r.json);
     r = await req(34561, "GET", "/health");
-    t("health version unified-4, NO account counts (J2-p12), fcmConfigured=false", r.json?.version === "unified-4" && r.json?.ok === true && r.json?.service === "amg-device-api" && !("accounts" in (r.json || {})) && !("syncedAccounts" in (r.json || {})) && r.json?.fcmConfigured === false, r.json);
+    t("health version unified-4.1, NO account counts (J2-p12), fcmConfigured=false", r.json?.version === "unified-4.1" && r.json?.ok === true && r.json?.service === "amg-device-api" && !("accounts" in (r.json || {})) && !("syncedAccounts" in (r.json || {})) && r.json?.fcmConfigured === false, r.json);
     await stopServer(server); server = null;
 
     // ---- Server B: dono tokens set ----
@@ -1199,6 +1199,57 @@ async function main() {
     r = await register(34581, "WB1806AA");
     r = await checkin(34581, r.json.deviceId, "WB1806AA");
     t("Z: J1-m53 future due -> stay_unlocked + graceDaysLeft=5", r.json?.instruction === "stay_unlocked" && r.json?.graceDaysLeft === 5, r.json);
+    await stopServer(server); server = null;
+
+    // ---- Server AA: J2-m36 check-in offlineCodeUsed + J2-m29 deviceOwnerLost ----
+    console.log("\n== AA. J2-m36 check-in offlineCodeUsed + J2-m29 deviceOwnerLost ==");
+    const dataAA = join(dir, "aa.json");
+    server = await startServer({ port: 34582, dataFile: dataAA, seedToken: SEED, syncToken: SYNC });
+    // J2-m36: code istemal se pehle false, istemal ke baad true, naye code cycle par phir false.
+    await req(34582, "POST", "/api/device/sync", syncBody(1901, "AA1901AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "AA1901X" }), syncH);
+    r = await register(34582, "AA1901AA");
+    const dev1901 = r.json.deviceId;
+    r = await checkin(34582, dev1901, "AA1901AA");
+    t("AA: J2-m36 lock_now se pehle offlineCodeUsed=false + code milta hai", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "AA1901X" && r.json?.offlineCodeUsed === false, r.json);
+    r = await req(34582, "POST", "/api/device/offline-code-used", { deviceId: dev1901, code: "AA1901X" });
+    t("AA: code istemal ok", r.json?.ok === true, r.json);
+    r = await checkin(34582, dev1901, "AA1901AA");
+    t("AA: J2-m36 code istemal ke baad check-in offlineCodeUsed=true (window)", r.json?.instruction === "stay_unlocked" && r.json?.offlineCodeUsed === true, r.json);
+    // Naya code cycle: fresh code + locked, latch reset -> false.
+    await req(34582, "POST", "/api/device/sync", syncBody(1901, "AA1901AA", [inst(1, pktDate(-10), 10000)], { lockState: "locked", unlockCode: "AA1901Y" }), syncH);
+    r = await checkin(34582, dev1901, "AA1901AA");
+    t("AA: J2-m36 naye code cycle par offlineCodeUsed=false + naya code milta hai", r.json?.instruction === "lock_now" && r.json?.offlineUnlockCode === "AA1901Y" && r.json?.offlineCodeUsed === false, r.json);
+    // J2-m29: deviceOwnerLost check-in se store hota hai, status mein nazar aata hai.
+    await req(34582, "POST", "/api/device/sync", syncBody(1902, "AA1902AA", [inst(1, pktDate(30), 10000)]), syncH);
+    r = await register(34582, "AA1902AA");
+    const dev1902 = r.json.deviceId;
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 shuru mein deviceOwnerLost=false", r.json?.deviceOwnerLost === false, r.json);
+    r = await req(34582, "POST", "/api/device/checkin", { deviceId: dev1902, pairingCode: "AA1902AA", deviceOwnerLost: true });
+    t("AA: J2-m29 deviceOwnerLost:true check-in ok", r.json?.ok === true, r.json);
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 status mein deviceOwnerLost=true", r.json?.deviceOwnerLost === true, r.json);
+    // Flag ke baghair check-in pehli value nahi badalta.
+    await checkin(34582, dev1902, "AA1902AA");
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 baghair flag check-in par value nahi badalti (true rehta hai)", r.json?.deviceOwnerLost === true, r.json);
+    // Bahaali: false bhejne par wapas false.
+    await req(34582, "POST", "/api/device/checkin", { deviceId: dev1902, pairingCode: "AA1902AA", deviceOwnerLost: false });
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 deviceOwnerLost:false par status wapas false", r.json?.deviceOwnerLost === false, r.json);
+    // Ghalat qism (string) ignore hoti hai.
+    await req(34582, "POST", "/api/device/checkin", { deviceId: dev1902, pairingCode: "AA1902AA", deviceOwnerLost: "yes" });
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 ghalat qism (string) ignore hoti hai", r.json?.deviceOwnerLost === false, r.json);
+    // Sync is phone-side field ko nahi chhoota + restart ke baad bhi mehfooz hai.
+    await req(34582, "POST", "/api/device/checkin", { deviceId: dev1902, pairingCode: "AA1902AA", deviceOwnerLost: true });
+    await req(34582, "POST", "/api/device/sync", syncBody(1902, "AA1902AA", [inst(1, pktDate(30), 10000)]), syncH);
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 routine sync flag nahi mitaati (true rehta hai)", r.json?.deviceOwnerLost === true, r.json);
+    await stopServer(server); server = null;
+    server = await startServer({ port: 34582, dataFile: dataAA, seedToken: SEED, syncToken: SYNC });
+    r = await req(34582, "GET", "/api/device/status?dashboardAccountId=1902", undefined, syncH);
+    t("AA: J2-m29 restart ke baad bhi deviceOwnerLost=true (disk par mehfooz)", r.json?.deviceOwnerLost === true, r.json);
     await stopServer(server); server = null;
   } finally {
     await stopServer(server);

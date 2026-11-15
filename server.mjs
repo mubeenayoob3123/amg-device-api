@@ -1,5 +1,6 @@
 // AMG Device API — unified device API v2.1 + FCM push (Wave 5.4, 15 Nov 2026)
-// Health version: "unified-4" (Audit Round 2 fixes, 15 Nov 2026).
+// Health version: "unified-4.1" (Audit Round 2 fixes + lock-app v1.4.0
+// coordination: J2-m36/J2-m29, 15 Nov 2026).
 // v2.1 sync contract BILKUL waisa hi hai — siwaaye neeche wali
 // unified-4 tabdeeliyon ke (J1-C03/J1-M23/J2-m25/J2-M13 + contract
 // additions; purani dashboard bhi chalti rehti hai, naye fields
@@ -18,6 +19,11 @@
 //     unlock/completed par jata tha).
 //   - Contract: check-in mein schedule + graceDays; register mein
 //     dashboardAccountId; purani pairing code par check-in
+//   - J2-m36 (unified-4.1): check-in jawab mein offlineCodeUsed
+//     (boolean) — lock app is se apna mehfooz code invalid karta hai.
+//   - J2-m29 (unified-4.1): check-in ke saath aaya deviceOwnerLost
+//     account par store hota hai, /api/device/status mein nazar
+//     aata hai (dashboard dukaan ko alert dikhaye).
 //     pairing_code_changed deta hai; lockApp:false account par
 //     lock/warn refuse hota hai (400 lock_not_allowed).
 // FCM sirf phone-API ka izafa hai: register/checkin mein optional
@@ -209,6 +215,8 @@ function load() {
     if (a.syncSeq === undefined) a.syncSeq = 0;
     if (a.lastPushError === undefined) a.lastPushError = "";
     if (a.lastPushErrorAt === undefined) a.lastPushErrorAt = "";
+    // unified-4.1 (J2-m29): Device Owner gum hone ka flag.
+    if (a.deviceOwnerLost === undefined) a.deviceOwnerLost = false;
     // PU-S10: purane seed accounts ka plaintext code salted hash mein
     // badal dein (synced accounts ka code dashboard ka hota hai — wo
     // plaintext hi rehta hai, kyunke server use har lock_now mein
@@ -753,6 +761,9 @@ function upsertSyncedAccount(norm, st = db) {
       // FCM token phone-side field hai — sync isay kabhi nahi set
       // karta; phone register/check-in mein bhejta hai.
       fcmToken: "",
+      // J2-m29: Device Owner flag bhi phone-side hai — sirf
+      // check-in se aata hai, sync isay kabhi nahi chhoota.
+      deviceOwnerLost: false,
       lastPushError: "",
       lastPushErrorAt: "",
       // unified-4: lockApp (na aaye to phone mana jata hai) +
@@ -832,7 +843,7 @@ const server = createServer(async (req, res) => {
       // zaroori hai (FCM guide ka Step 7 isi par hai) aur sirf aik
       // boolean batata hai, koi data nahi.
       return send(res, 200, {
-        ok: true, service: "amg-device-api", version: "unified-4",
+        ok: true, service: "amg-device-api", version: "unified-4.1",
         // FCM (Wave 5.4): service account set hai ya nahi — setup check ke liye.
         fcmConfigured: Boolean(FCM_SA),
       });
@@ -931,6 +942,16 @@ const server = createServer(async (req, res) => {
       // naya token ho to update kar dein (neeche save() isay likhta hai).
       const fcmToken = validFcmToken(b.fcmToken);
       if (fcmToken && fcmToken !== acct.fcmToken) { acct.fcmToken = fcmToken; changed = true; }
+      // J2-m29: Device Owner status gum ho to app check-in ke
+      // saath deviceOwnerLost bhejti hai. Field maujood ho to
+      // store karein (true ya false dono — app bahaal hone par
+      // false bhej sakti hai); na ho to pehli value rehne dein.
+      // Sirf tab badle jab value waqai badli ho (J2-m20: bekaar
+      // save nahi hota).
+      if (typeof b.deviceOwnerLost === "boolean" && b.deviceOwnerLost !== (acct.deviceOwnerLost === true)) {
+        acct.deviceOwnerLost = b.deviceOwnerLost;
+        changed = true;
+      }
       // Synced account = dashboard ki replica. Is ka offline unlock code
       // sirf dashboard deta hai — server is ke liye apna code KABHI nahi
       // banata. Server code sirf /api/test/seed wale accounts ke liye hai.
@@ -1060,6 +1081,11 @@ const server = createServer(async (req, res) => {
         ...(offlineUnlockCode ? { offlineUnlockCode } : {}),
         // D-M6: active 24h unlock window ki akhri tareekh (app dikha sakta hai).
         ...(windowActive ? { offlineUnlockUntil: acct.offlineUnlockUntil } : {}),
+        // J2-m36: is code cycle ka code istemal ho chuka hai ya nahi
+        // (lock app true par apna mehfooz code invalid kar deta hai).
+        // Jawab bante waqt ki taaza value hai (is hi check-in mein
+        // naya code bana ho to false, kyunke naya code istemal nahi hua).
+        offlineCodeUsed: acct.offlineCodeUsed === 1,
       });
     }
 
@@ -1284,6 +1310,9 @@ const server = createServer(async (req, res) => {
         // kabhi push nahi hua) — push ki nakami ab nazar aati hai.
         lastPushError: acct.lastPushError || "",
         lastPushErrorAt: acct.lastPushErrorAt || "",
+        // J2-m29: Device Owner gum hua hai ya nahi (check-in se
+        // aaya) — dashboard is par dukaan ko alert dikhaye.
+        deviceOwnerLost: acct.deviceOwnerLost === true,
       });
     }
 
@@ -1315,6 +1344,7 @@ const server = createServer(async (req, res) => {
         resetPin: "", registeredWithCode: "", lastReregisterAt: "",
         deviceId: null, deviceRegistered: 0, deviceName: "", imei: "", lastSeenAt: "",
         fcmToken: "",
+        deviceOwnerLost: false,
       };
       db.accounts.push(acct);
       for (let i = 0; i < months; i++) {
@@ -1378,5 +1408,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`AMG device API unified-4 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"}, fcm ${FCM_SA ? "enabled" : "DISABLED: set FCM_SERVICE_ACCOUNT_JSON"})`);
+  console.log(`AMG device API unified-4.1 — http://localhost:${PORT} (seed ${SEED_TOKEN ? "enabled" : "DISABLED: set AMG_SEED_TOKEN"}, sync ${SYNC_TOKEN ? "enabled" : "DISABLED: set AMG_SYNC_TOKEN"}, fcm ${FCM_SA ? "enabled" : "DISABLED: set FCM_SERVICE_ACCOUNT_JSON"})`);
 });

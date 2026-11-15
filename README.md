@@ -1,4 +1,4 @@
-# AMG Device API — dashboard ka phone wala hissa (UNIFIED v2.1 + FCM HTTP v1, health version `unified-4`)
+# AMG Device API — dashboard ka phone wala hissa (UNIFIED v2.1 + FCM HTTP v1, health version `unified-4.1`)
 
 ## Seedhi baat — ye kya hai?
 
@@ -28,11 +28,14 @@ Lock app EXACTLY ye 3 raaste mangti hai:
   (shop ki Wi-Fi par aik phone ki ghaltiyan doosre ko nahi rokti).
   Aik hi code do accounts par ho to register `pairing_code_ambiguous`
   de kar refuse karta hai (pehle match par bandhna band hai).
-- `POST /api/device/checkin` — `{ deviceId, pairingCode, fcmToken? }` →
-  `stay_unlocked` | `warn` | `lock_now` | `permanent_unlock`.
-  Dashboard ne pairing code dobara bana diya ho to check-in
-  `pairing_code_changed` deta hai (dobara register karna hota hai).
-  Check-in par per-device rate limit hai (1 minute mein 20).
+- `POST /api/device/checkin` — `{ deviceId, pairingCode, fcmToken?,
+  deviceOwnerLost? }` → `stay_unlocked` | `warn` | `lock_now` |
+  `permanent_unlock`. Dashboard ne pairing code dobara bana diya ho to
+  check-in `pairing_code_changed` deta hai (dobara register karna hota
+  hai). Check-in par per-device rate limit hai (1 minute mein 20).
+  `deviceOwnerLost: true` (Device Owner status gum ho) account par
+  mehfooz hota hai aur `/api/device/status` mein nazar aata hai
+  (dashboard dukaan ko alert dikhaye).
 - `POST /api/device/offline-code-used` — `{ deviceId, code }` (rate
   limit deviceId par hai, IP par nahi).
 
@@ -43,7 +46,10 @@ unlock window mein `offlineUnlockUntil`. v2.1 mein mazeed:
 `installmentNumber` / `installmentTotal` ("Qist #3 of 6") aur inclusive
 `graceDaysLeft` (aakhri grace din = 1). unified-4 mein mazeed: poori qist
 `schedule` (`[{seq, dueDate, amount, paidAmount}]`) + `graceDays` — lock app
-isay mehfooz kar ke offline deadline lock lagati hai. Warning due date ke
+isay mehfooz kar ke offline deadline lock lagati hai. unified-4.1 mein
+mazeed: check-in jawab mein `offlineCodeUsed` (boolean — is code cycle
+ka code istemal ho chuka hai ya nahi; lock app true par apna mehfooz code
+invalid kar deta hai). Warning due date ke
 AGLE din se lagti hai (due date khud reminder ka din hai); `graceDaysLeft`
 due date par poora grace dikhata hai (pehle grace+1 dikhta tha). Offline code
 istemal par 24 ghante ki window shuru hoti hai — is doran phone unlocked
@@ -159,14 +165,14 @@ wapas aa jata hai (khaamoshi se khaali shuruaat nahi hoti).
 ```bash
 cd live-server
 AMG_SEED_TOKEN=koi-mushkil-token AMG_SYNC_TOKEN=koi-aur-mushkil-token node server.mjs
-# phir http://localhost:3000/health kholein — {"ok":true,"version":"unified-4",...} aana chahiye
+# phir http://localhost:3000/health kholein — {"ok":true,"version":"unified-4.1",...} aana chahiye
 ```
 
 Tests (sab local, koi live data nahi chhoota):
 
 ```bash
 node unified-server-test.mjs
-# 269/269 pass — sync, sync-all shop scoping, autoLock, wipe recovery,
+# 281/281 pass — sync, sync-all shop scoping, autoLock, wipe recovery,
 # offline 24h window, sticky latch, seed/pay, validation, v2.1 (window
 # restore, new-code reset, manual-lock-wins, re-register guard, reset
 # PIN, code rotation, qist number, inclusive grace, addMonths clamp,
@@ -176,7 +182,8 @@ node unified-server-test.mjs
 # atomicity, J1-M24 re-keyed limits, J2-M10 backup, J2-M11 body
 # limits, J2-M12 ambiguity, J2-m19 redaction, J2-m20 check-in limit
 # + save-on-change, J2-m23–m28, J2-p11–p13, J1-m53, J1-p16, lockApp
-# guard, syncSeq, schedule/graceDays, pairing_code_changed)
+# guard, syncSeq, schedule/graceDays, pairing_code_changed) + J2-m36
+# check-in offlineCodeUsed + J2-m29 deviceOwnerLost
 ```
 
 ## Render par deploy
